@@ -11,6 +11,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 fancy-regex = "0.19"
 memmap2 = "0.9"
+num_cpus = "1.17.0"
 rayon = "1"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
@@ -21,3 +22,7 @@ unicode-normalization = "0.1"
 lto = "fat"
 codegen-units = 1
 debug = "line-tables-only"
+
+[lints.clippy]
+# `chunks_exact(BLOCK)` reads better than `as_chunks::<BLOCK>().0.iter()` in the block loops.
+chunks_exact_to_as_chunks = "allow"

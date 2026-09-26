@@ -1,7 +1,12 @@
 pub mod config;
+pub mod eval;
 pub mod generate;
+pub mod kernels;
+pub mod linear;
 pub mod model;
 pub mod ops;
+pub mod pool;
+pub mod quant;
 pub mod safetensors;
 pub mod sampler;
 pub mod tokenizer;

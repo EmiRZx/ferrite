@@ -3,15 +3,17 @@
 A from-scratch CPU inference engine for large language models, written in Rust.
 
 No ML frameworks. The safetensors loader, byte-level BPE tokenizer, transformer
-forward pass, sampler and all compute kernels are implemented in this repository,
-and every step is verified numerically against Hugging Face `transformers`.
+forward pass, quantization formats, SIMD kernels, thread pool and sampler are all
+implemented in this repository, and every step is verified numerically against
+Hugging Face `transformers`.
 
-The target model is [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B); the goal is to
+The target model is [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B). The goal is to
 take it from a naive scalar implementation to a fast, quantized, SIMD-optimized engine
 and document *why* each optimization works along the way.
 
 ```text
-$ ferrite run "What is the capital of France? Answer in one sentence." -t 0
+$ ferrite -d q4 run "What is the capital of France? Answer in one sentence." -t 0
+loaded models/qwen3-0.6b as q4 in 4.08s (429 MiB of weights, avx512 kernels, 8 threads)
 The capital of France is Paris.
 ```
 
@@ -27,8 +29,71 @@ cd ../..
 
 cargo run --release -- run "Explain Rust ownership in two sentences."
 cargo run --release -- run --think "How many r's are in strawberry?"
-cargo run --release -- bench --prompt-len 128 --gen-len 128
+cargo run --release -- -d q4 bench --prompt-len 128 --gen-len 128
+
+# quality: perplexity on WikiText-2, KL divergence against the f32 model
+uv run scripts/fetch_wikitext.py
+cargo run --release -- -d q4 eval models/wikitext-2-test.txt --baseline f32
+
+# kernel micro-benchmarks
+cargo run --release --example kernels
 ```
+
+Options: `-d/--dtype f32|bf16|q8|q4` (default `q8`), `--threads N` (default: physical
+cores), `FERRITE_ISA=scalar|avx2|avx512` to force a kernel set.
+
+## Results
+
+Machine: AMD Ryzen 9 7940HS (Zen 4, 8C/16T, AVX-512 + VNNI), 16 GB DDR5-5600 (measured
+streaming read: ~50 GB/s), Windows 11. Greedy decoding, 8 threads.
+
+| weights | size | decode tok/s | weight bandwidth | WikiText-2 ppl | KL vs f32 | top-1 agreement |
+|---|---:|---:|---:|---:|---:|---:|
+| f32 | 2274 MiB | 20.9 | 49.9 GB/s | 29.19 | – | – |
+| bf16 | 1137 MiB | 40.3 | 48.0 GB/s | 29.19 | 0.000 | 100% |
+| Q8 | 639 MiB | 67.3 | 45.1 GB/s | 29.08 | 0.003 | 96.8% |
+| Q4 (head in Q8) | 429 MiB | 85.0 | 38.3 GB/s | 32.91 | 0.189 | 76.5% |
+
+Decode: median of 5 runs of 128 tokens (laptop, so expect ±10% between sessions).
+Quality: 4 windows of 512 tokens from the WikiText-2 test set.
+bf16 is bit-identical to f32 because the checkpoint *is* bf16. Q8 is effectively
+lossless. Q4 costs real quality on a model this small. Choosing each block's scale by
+least-squares search instead of max-scaling cut KL from 0.210 to 0.189. Mixed precision
+for sensitive layers is next (see roadmap).
+
+Prefill currently runs token by token, so it matches decode speed. Batching it into a
+GEMM (M3) is the next big step.
+
+## How it got fast
+
+Decoding one token multiplies every weight matrix by a single vector, so each weight
+is read exactly once and used for exactly one multiply-add. That is ~0.25 FLOP per
+byte for f32, far below what the cores can do per byte of DRAM bandwidth: **decode is
+memory-bound**, and tokens/s ≈ bandwidth / bytes of weights. Every step below
+either moves fewer bytes or gets closer to the bandwidth ceiling.
+
+Decode tok/s after each step, measured as the step landed (laptop numbers drift by
+about ±10% between runs):
+
+| step | f32 | bf16 | Q8 | Q4 | why |
+|---|---:|---:|---:|---:|---|
+| M0: scalar kernels, rayon | 13.4 | | | | baseline: ~32 GB/s already |
+| + AVX2 / AVX-512 kernels | 17.3 | 28.1 | 39.4 | 52.1 | f32 at ~41 GB/s; halving the bytes (bf16) nearly doubles speed |
+| + spin-waiting pool, fused QKV / gate-up | 20.2 | 38.8 | 61.8 | 86.1 | removes ~5 ms/token of thread wake-ups and dispatch |
+| + SIMD activation quantization | | | 71.8 | 92.1 | `f32::round` was a libm call per element on baseline x86-64 |
+| + unsigned-offset VNNI kernel | | | ± 0 | +5–10% | ~30% faster in cache (micro-benchmark), but decode is near the bandwidth limit |
+
+Things that did *not* help, and why:
+
+- **Static row partitioning** (one contiguous chunk per thread) was slower than
+  work-stealing: a single thread that gets descheduled or runs at a lower clock holds
+  up the whole matvec. The pool therefore hands out 16-row chunks through an atomic counter.
+- **16 threads (SMT)**: SMT siblings share a core's load ports, so they add no
+  bandwidth, and a spinning barrier is only as fast as its slowest thread. 16 threads
+  ran ~40% *slower* than 8.
+- **AVX-512 over AVX2** barely matters for decode: Zen 4 executes 512-bit ops as two
+  256-bit halves, and the loop is waiting on memory anyway. The micro-benchmark shows
+  both at ~37 GFLOP/s per core on in-cache data vs 2.7 for scalar code.
 
 ## Correctness
 
@@ -39,30 +104,52 @@ checks ferrite against them:
 | check | result |
 |---|---|
 | tokenizer (12 cases: Unicode, NFC, code, whitespace, special tokens) | exact match |
-| max \|logit − reference\| over top-10 logits at every prompt position | 1.0e-4 |
+| max \|logit − reference\| over top-10 logits at every prompt position | 6.4e-5 |
 | 32-token greedy continuation | exact match |
 
-## Benchmarks
+Every SIMD kernel is also tested against its scalar reference on ragged lengths, and
+the thread pool has tests for coverage, disjoint writes and panic propagation.
 
-Machine: AMD Ryzen 9 7940HS (Zen 4, 8C/16T, AVX-512), 16 GB DDR5, Windows 11.
-Greedy decoding, 64-token prompt, 64 generated tokens.
+## Design notes
 
-| version | weights | prefill tok/s | decode tok/s | effective weight bandwidth |
-|---|---|---:|---:|---:|
-| M0: scalar f32, 1 thread | 2.27 GiB | 2.2 | 2.2 | 5 GB/s |
-| M0: scalar f32, rayon (8 threads) | 2.27 GiB | 13.4 | 13.4 | 32 GB/s |
+**Quantization formats** (`src/quant.rs`). Rows are split into blocks of 32 values
+with one f32 scale each, stored struct-of-arrays so kernels stream quants and scales linearly.
+Q8 stores `round(w / d)` in `[-127, 127]` (1.125 bytes/weight). Q4 stores 4-bit values
+with the block's largest-magnitude weight mapped exactly to -8 (0.625 bytes/weight).
+In Q4 mode the embedding / LM head (26% of all parameters) stays Q8.
 
-Decode on CPU is memory-bandwidth bound: every generated token streams every weight
-through the cores once. With the naive kernels we already reach ~32 GB/s,
-so the next big wins come from moving fewer bytes (bf16 / int8 / int4 weights), while
-prefill will become compute-bound once it is batched into a GEMM.
+**Integer dot products** (`src/kernels/`). Activations are quantized to Q8 on the fly
+(once per matvec, together with each block's sum), so the inner loop is an int8 dot
+product. With AVX-512 VNNI one `vpdpbusd` multiplies 64 byte pairs and accumulates groups
+of four into 16 int32 lanes. It needs one *unsigned* operand. Instead of shuffling signs
+every iteration, the weights are made unsigned by an offset `c` and the error is
+removed exactly in integers: `Σ w·x = Σ (w + c)·x − c·Σx`. Q4 nibbles already are
+`w + 8`. Q8 uses `w XOR 0x80 = w + 128`. The `−c·Σx` term seeds the accumulator, so the
+correction costs one masked permute per two blocks, and scales are applied 16 blocks at a
+time with vector permutes. Q4 nibbles are unpacked with a lane shuffle, a masked shift and an AND.
+The AVX2 path uses the classic `maddubs` sign trick instead, because its 16-bit
+intermediate would overflow with `w + 128`.
+
+**Runtime dispatch** (`src/kernels/mod.rs`). Kernels are `#[target_feature]` functions
+collected into per-ISA tables of function pointers. The best table the CPU supports is
+chosen once at startup, so one binary runs everywhere and the scalar path remains
+available as a reference.
+
+**Spin-waiting thread pool** (`src/pool.rs`). A decode step issues ~140 parallel
+regions of 10–50 µs each. Rayon parks idle workers, and waking them cost about as much as
+the work (a 1024×1024 matvec: 21 µs with rayon vs 13 µs here). Workers spin on an
+epoch counter between jobs (parking after ~1 ms idle), and the caller runs as thread 0.
+
+**Fused projections**. Q/K/V and gate/up share their input, so they are stacked into
+one matrix each: 4 matvecs per layer instead of 7.
 
 ## Roadmap
 
 - [x] **M0**: safetensors (mmap), BPE tokenizer, Qwen3 forward pass (GQA, QK-norm, RoPE), KV cache, sampling, CLI, reference tests
-- [ ] **M1**: SIMD kernels (AVX2 / AVX-512) with runtime CPU feature dispatch, micro-benchmarks
-- [ ] **M2**: bf16 weights, then int8 / int4 weight-only quantization (VNNI dot products)
+- [x] **M1**: SIMD kernels (AVX2 / AVX-512) with runtime CPU feature dispatch, micro-benchmarks
+- [x] **M2**: bf16 / Q8 / Q4 weights with VNNI integer dot products, spin-waiting thread pool, fused projections, perplexity + KL evaluation
 - [ ] **M3**: batched prefill with a cache-blocked GEMM
+- [ ] Mixed-precision Q4 (sensitive layers such as `down_proj` / `v_proj` in Q8), in the spirit of llama.cpp's Q4_K_M
 - [ ] **M4**: OpenAI-compatible HTTP server with streaming
 - [ ] **M5**: comparison against llama.cpp, roofline analysis write-up
 
@@ -73,11 +160,17 @@ src/
   safetensors.rs   zero-copy .safetensors reader
   tokenizer.rs     byte-level BPE (HF tokenizer.json compatible) + streaming UTF-8 decoder
   model.rs         Qwen3 weights, KV cache, forward pass
-  ops.rs           reference kernels: matvec, RMSNorm, RoPE, softmax
+  linear.rs        linear layers over f32 / bf16 / Q8 / Q4 weights
+  quant.rs         block quantization formats
+  kernels/         scalar, AVX2 and AVX-512 (VNNI) kernels + runtime dispatch
+  pool.rs          low-latency spin-waiting thread pool
+  ops.rs           RMSNorm, RoPE, softmax, SiLU
   sampler.rs       temperature / top-k / top-p sampling
   generate.rs      generation loop, chat template
+  eval.rs          perplexity, KL divergence, top-1 agreement
   main.rs          CLI
-scripts/reference.py   dumps HF transformers outputs for the tests
+examples/kernels.rs     matvec / bandwidth micro-benchmarks
+scripts/reference.py    dumps HF transformers outputs for the tests
 ```
 
 ## License

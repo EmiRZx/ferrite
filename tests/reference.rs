@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use ferrite::{
     generate::generate,
+    linear::DType,
     model::Model,
     sampler::{Sampler, SamplingParams},
     tokenizer::Tokenizer,
@@ -71,7 +72,7 @@ fn tokenizer_matches_hf() {
 #[test]
 fn logits_and_greedy_match_hf() {
     let Some((dir, fx)) = setup() else { return };
-    let model = Model::load(&dir, 256).unwrap();
+    let model = Model::load(&dir, 256, DType::F32).unwrap();
     let mut session = model.new_session();
 
     let mut max_err = 0f32;

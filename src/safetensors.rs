@@ -122,16 +122,20 @@ impl SafeTensors {
         Ok(&self.mmap[self.data_start + info.start..self.data_start + info.end])
     }
 
-    /// Loads a tensor as f32, checking that its shape matches `shape`.
-    pub fn load_f32(&self, name: &str, shape: &[usize]) -> Result<Vec<f32>> {
+    fn checked(&self, name: &str, shape: &[usize]) -> Result<(Dtype, &[u8])> {
         let info = self.info(name)?;
         ensure!(
             info.shape == shape,
             "{name}: expected shape {shape:?}, found {:?}",
             info.shape
         );
-        let bytes = self.bytes(name)?;
-        Ok(match info.dtype {
+        Ok((info.dtype, self.bytes(name)?))
+    }
+
+    /// Loads a tensor as f32, checking that its shape matches `shape`.
+    pub fn load_f32(&self, name: &str, shape: &[usize]) -> Result<Vec<f32>> {
+        let (dtype, bytes) = self.checked(name, shape)?;
+        Ok(match dtype {
             Dtype::F32 => bytes
                 .as_chunks::<4>()
                 .0
@@ -146,10 +150,39 @@ impl SafeTensors {
                 .collect(),
         })
     }
+
+    /// Loads a tensor as raw bf16 bits, rounding if it is stored as f32.
+    pub fn load_bf16(&self, name: &str, shape: &[usize]) -> Result<Vec<u16>> {
+        let (dtype, bytes) = self.checked(name, shape)?;
+        Ok(match dtype {
+            Dtype::F32 => bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&b| f32_to_bf16(f32::from_le_bytes(b)))
+                .collect(),
+            Dtype::BF16 => bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&b| u16::from_le_bytes(b))
+                .collect(),
+        })
+    }
 }
 
 /// bf16 is the upper half of an f32, so widening is a shift.
 #[inline]
 pub fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
+}
+
+/// Round-to-nearest-even narrowing, keeping NaNs quiet.
+pub fn f32_to_bf16(v: f32) -> u16 {
+    let bits = v.to_bits();
+    if v.is_nan() {
+        return ((bits >> 16) | 0x40) as u16;
+    }
+    let rounding = 0x7FFF + ((bits >> 16) & 1);
+    (bits.wrapping_add(rounding) >> 16) as u16
 }

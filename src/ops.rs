@@ -1,22 +1,4 @@
-//! Scalar reference kernels. These are the baseline that later SIMD / quantized
-//! kernels are benchmarked and tested against.
-
-use rayon::prelude::*;
-
-#[inline]
-pub fn dot(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len());
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
-}
-
-/// `out = W x` where `w` is row-major `[out.len(), x.len()]` (PyTorch `nn.Linear` layout).
-pub fn matvec(out: &mut [f32], w: &[f32], x: &[f32]) {
-    let n = x.len();
-    debug_assert_eq!(w.len(), out.len() * n);
-    out.par_iter_mut()
-        .zip(w.par_chunks_exact(n))
-        .for_each(|(o, row)| *o = dot(row, x));
-}
+//! Small element-wise ops. The heavy lifting (dot products) lives in `kernels`.
 
 pub fn rmsnorm(out: &mut [f32], x: &[f32], weight: &[f32], eps: f32) {
     let mean_sq = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
@@ -102,14 +84,6 @@ mod tests {
         softmax_inplace(&mut x);
         assert!((x.iter().sum::<f32>() - 1.0).abs() < 1e-6);
         assert_eq!(x[3], 0.0);
-    }
-
-    #[test]
-    fn matvec_matches_manual() {
-        let w = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let mut out = [0.0; 2];
-        matvec(&mut out, &w, &[1.0, 0.0, -1.0]);
-        assert_eq!(out, [-2.0, -2.0]);
     }
 
     #[test]
