@@ -107,7 +107,8 @@ pub fn dequantize_q4(qs: &[u8], scales: &[f32], out: &mut [f32]) {
     }
 }
 
-/// An activation vector quantized to Q8, reused across matvecs.
+/// Activations quantized to Q8, reused across matvecs. May hold several tokens'
+/// vectors back to back; blocks never straddle two tokens since rows are whole blocks.
 #[derive(Default)]
 pub struct Q8Vec {
     pub qs: Vec<i8>,
@@ -129,6 +130,27 @@ impl Q8Vec {
                 .map(|b| b.iter().map(|&q| q as i32).sum::<i32>()),
         );
     }
+
+    pub fn as_slice(&self) -> Q8Slice<'_> {
+        self.blocks(0, self.scales.len())
+    }
+
+    /// Blocks `start..start + len`, e.g. one token's row.
+    pub fn blocks(&self, start: usize, len: usize) -> Q8Slice<'_> {
+        Q8Slice {
+            qs: &self.qs[start * BLOCK..][..len * BLOCK],
+            scales: &self.scales[start..][..len],
+            sums: &self.sums[start..][..len],
+        }
+    }
+}
+
+/// A borrowed run of blocks from a [`Q8Vec`].
+#[derive(Clone, Copy)]
+pub struct Q8Slice<'a> {
+    pub qs: &'a [i8],
+    pub scales: &'a [f32],
+    pub sums: &'a [i32],
 }
 
 #[cfg(test)]

@@ -19,7 +19,11 @@ impl GenStats {
 
     /// The first generated token comes out of prefill, so decode covers the rest.
     pub fn decode_tok_s(&self) -> f64 {
-        self.generated_tokens.saturating_sub(1) as f64 / self.decode_time.as_secs_f64()
+        let decoded = self.generated_tokens.saturating_sub(1);
+        if decoded == 0 {
+            return 0.0;
+        }
+        decoded as f64 / self.decode_time.as_secs_f64()
     }
 }
 
@@ -46,11 +50,7 @@ pub fn generate(
     };
 
     let start = Instant::now();
-    let mut logits = &[][..];
-    for &t in prompt {
-        logits = session.forward(t)?;
-    }
-    let mut next = sampler.sample(logits);
+    let mut next = sampler.sample(session.prefill(prompt)?);
     stats.prefill_time = start.elapsed();
 
     let start = Instant::now();

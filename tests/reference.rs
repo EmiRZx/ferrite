@@ -87,6 +87,25 @@ fn logits_and_greedy_match_hf() {
     eprintln!("max |logit - reference| over top-10 at all positions: {max_err:.2e}");
     assert!(max_err < 1e-2, "logits drifted: {max_err}");
 
+    // The batched path (GEMM + causal attention over the whole prompt) must agree too.
+    session.reset();
+    let vocab = model.config.vocab_size;
+    let all = session.forward_all(&fx.prompt_ids).unwrap().to_vec();
+    let mut max_err = 0f32;
+    for (pos, expected) in fx.positions.iter().enumerate() {
+        let logits = &all[pos * vocab..][..vocab];
+        assert_eq!(
+            ferrite::sampler::argmax(logits),
+            expected.ids[0],
+            "batched argmax at {pos}"
+        );
+        for (&id, &want) in expected.ids.iter().zip(&expected.logits) {
+            max_err = max_err.max((logits[id as usize] - want).abs());
+        }
+    }
+    eprintln!("batched: max |logit - reference|: {max_err:.2e}");
+    assert!(max_err < 1e-2, "batched logits drifted: {max_err}");
+
     session.reset();
     let mut sampler = Sampler::new(SamplingParams::greedy(), 0);
     let mut out = Vec::new();
@@ -103,4 +122,31 @@ fn logits_and_greedy_match_hf() {
     )
     .unwrap();
     assert_eq!(out, fx.greedy);
+}
+
+/// The batched path (tiled GEMM kernels for quantized weights) must match running the
+/// same model one token at a time.
+#[test]
+fn batched_matches_sequential_for_every_dtype() {
+    let Some((dir, fx)) = setup() else { return };
+    for dtype in [DType::Bf16, DType::Q8, DType::Q4] {
+        let model = Model::load(&dir, 256, dtype).unwrap();
+        let vocab = model.config.vocab_size;
+        let mut session = model.new_session();
+        let batched = session.forward_all(&fx.prompt_ids).unwrap().to_vec();
+        session.reset();
+        let mut max_err = 0f32;
+        for (pos, &token) in fx.prompt_ids.iter().enumerate() {
+            let logits = session.forward(token).unwrap();
+            let row = &batched[pos * vocab..][..vocab];
+            for (a, b) in logits.iter().zip(row) {
+                max_err = max_err.max((a - b).abs());
+            }
+        }
+        eprintln!("{dtype}: max |batched - sequential| = {max_err:.2e}");
+        assert!(
+            max_err < 1e-3,
+            "{dtype}: batched and sequential logits differ by {max_err}"
+        );
+    }
 }

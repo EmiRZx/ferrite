@@ -189,3 +189,16 @@ pub fn quantize_q8(x: &[f32], qs: &mut [i8], scales: &mut [f32]) {
         unsafe { _mm256_storeu_si256(qs.as_mut_ptr().add(b * BLOCK).cast(), ordered) };
     }
 }
+
+/// The generic attention kernel, compiled (and auto-vectorized) for this ISA.
+#[target_feature(enable = "avx2,fma")]
+pub fn attention(
+    q: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    limits: &[usize],
+    scale: f32,
+    out: &mut [f32],
+) {
+    super::attention::attention_impl::<true>(q, keys, values, limits, scale, out)
+}

@@ -1,7 +1,9 @@
-//! Small element-wise ops. The heavy lifting (dot products) lives in `kernels`.
+//! Small element-wise ops. Dot products and attention come from `kernels`.
+
+use crate::kernels::kernels;
 
 pub fn rmsnorm(out: &mut [f32], x: &[f32], weight: &[f32], eps: f32) {
-    let mean_sq = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
+    let mean_sq = (kernels().dot_f32)(x, x) / x.len() as f32;
     let scale = 1.0 / (mean_sq + eps).sqrt();
     for ((o, &v), &w) in out.iter_mut().zip(x).zip(weight) {
         *o = v * scale * w;
@@ -9,22 +11,11 @@ pub fn rmsnorm(out: &mut [f32], x: &[f32], weight: &[f32], eps: f32) {
 }
 
 pub fn rmsnorm_inplace(x: &mut [f32], weight: &[f32], eps: f32) {
-    let mean_sq = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
+    let mean_sq = (kernels().dot_f32)(x, x) / x.len() as f32;
     let scale = 1.0 / (mean_sq + eps).sqrt();
     for (v, &w) in x.iter_mut().zip(weight) {
         *v *= scale * w;
     }
-}
-
-pub fn softmax_inplace(x: &mut [f32]) {
-    let max = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mut sum = 0.0;
-    for v in x.iter_mut() {
-        *v = (*v - max).exp();
-        sum += *v;
-    }
-    let inv = 1.0 / sum;
-    x.iter_mut().for_each(|v| *v *= inv);
 }
 
 #[inline]
@@ -77,14 +68,6 @@ impl Rope {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn softmax_sums_to_one() {
-        let mut x = vec![1.0, 2.0, 3.0, -1000.0];
-        softmax_inplace(&mut x);
-        assert!((x.iter().sum::<f32>() - 1.0).abs() < 1e-6);
-        assert_eq!(x[3], 0.0);
-    }
 
     #[test]
     fn rope_at_zero_is_identity() {

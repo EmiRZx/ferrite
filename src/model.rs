@@ -6,18 +6,22 @@
 //! x = h + down_proj(silu(gate_proj(n2)) * up_proj(n2))                                     n2 = rmsnorm(h)
 //! ```
 
-use std::path::Path;
+use std::{cell::RefCell, path::Path};
 
 use crate::{
     config::Config,
-    kernels::kernels,
+    kernels::{
+        attention::{MAX_HEAD_DIM, MAX_QUERIES, TILE as ATT_TILE, key_index},
+        kernels,
+    },
     linear::{DType, Linear},
     ops::{self, Rope},
     pool::pool,
+    profile::{self, Section},
     quant::Q8Vec,
     safetensors::SafeTensors,
 };
-use anyhow::{Result, ensure};
+use anyhow::{Result, bail, ensure};
 
 struct Layer {
     input_norm: Vec<f32>,
@@ -52,6 +56,12 @@ impl Model {
         let c = &config;
         let (d, hd) = (c.hidden_size, c.head_dim());
         let max_seq = max_seq.min(c.max_position_embeddings);
+        ensure!(hd <= MAX_HEAD_DIM, "head_dim {hd} exceeds {MAX_HEAD_DIM}");
+        ensure!(
+            c.num_attention_heads % c.num_key_value_heads == 0
+                && c.num_attention_heads / c.num_key_value_heads <= MAX_QUERIES,
+            "unsupported GQA grouping"
+        );
         let head_dtype = if dtype == DType::Q4 { DType::Q8 } else { dtype };
 
         let layers = (0..c.num_hidden_layers)
@@ -142,41 +152,69 @@ impl Model {
     }
 }
 
-/// Per-sequence KV cache, laid out `[layer][kv_head][pos][head_dim]` so that the
-/// attention loop for one head streams through contiguous memory.
+/// Per-sequence KV cache with one contiguous region per `(layer, kv_head)`.
+/// Values are `[pos][head_dim]`. Keys are transposed in tiles of 32 positions
+/// (`[tile][head_dim][32]`, see `kernels::attention`) so attention can score a
+/// whole tile with vector FMAs.
 struct KvCache {
     k: Vec<f32>,
     v: Vec<f32>,
-    max_seq: usize,
+    /// Capacity in positions, rounded up to whole key tiles.
+    capacity: usize,
     n_kv: usize,
     hd: usize,
 }
 
 impl KvCache {
     fn new(c: &Config, max_seq: usize) -> Self {
-        let len = c.num_hidden_layers * c.num_key_value_heads * max_seq * c.head_dim();
+        let capacity = max_seq.div_ceil(ATT_TILE) * ATT_TILE;
+        let len = c.num_hidden_layers * c.num_key_value_heads * capacity * c.head_dim();
         Self {
             k: vec![0.0; len],
             v: vec![0.0; len],
-            max_seq,
+            capacity,
             n_kv: c.num_key_value_heads,
             hd: c.head_dim(),
         }
     }
 
     fn head_offset(&self, layer: usize, head: usize) -> usize {
-        (layer * self.n_kv + head) * self.max_seq * self.hd
+        (layer * self.n_kv + head) * self.capacity * self.hd
+    }
+
+    fn store(&mut self, layer: usize, head: usize, pos: usize, key: &[f32], value: &[f32]) {
+        let base = self.head_offset(layer, head);
+        for (d, &k) in key.iter().enumerate() {
+            self.k[base + key_index(pos, d, self.hd)] = k;
+        }
+        self.v[base + pos * self.hd..][..self.hd].copy_from_slice(value);
     }
 }
 
-/// Scratch buffers reused across forward passes.
+/// Queries per attention task. Fewer than the kernel's maximum so that a 64-token
+/// prefill chunk still splits into enough tasks to keep every core busy.
+const ATTENTION_BLOCK_QUERIES: usize = 16;
+
+thread_local! {
+    /// Per-thread gather / scatter buffers for attention queries and outputs.
+    static ATTENTION_SCRATCH: RefCell<(Vec<f32>, Vec<f32>)> =
+        RefCell::new((vec![0.0; MAX_QUERIES * MAX_HEAD_DIM], vec![0.0; MAX_QUERIES * MAX_HEAD_DIM]));
+}
+
+/// Tokens per forward pass during prefill. Larger batches reuse each weight more
+/// times, but the activations stop fitting in L2.
+pub const PREFILL_CHUNK: usize = 64;
+
+/// Scratch buffers reused across forward passes, sized for [`PREFILL_CHUNK`] tokens.
+/// Each is row-major `[tokens, width]`.
 struct Buffers {
     x: Vec<f32>,
     xb: Vec<f32>,
     qkv: Vec<f32>,
     att: Vec<f32>,
-    scores: Vec<f32>,
     gate_up: Vec<f32>,
+    mlp: Vec<f32>,
+    /// `[vocab]` for the last token, or `[tokens, vocab]` when all logits are requested.
     logits: Vec<f32>,
     xq: Q8Vec,
 }
@@ -192,16 +230,17 @@ pub struct Session<'m> {
 impl<'m> Session<'m> {
     fn new(model: &'m Model) -> Self {
         let c = &model.config;
+        let n = PREFILL_CHUNK;
         Self {
             model,
             cache: KvCache::new(c, model.max_seq),
             buf: Buffers {
-                x: vec![0.0; c.hidden_size],
-                xb: vec![0.0; c.hidden_size],
-                qkv: vec![0.0; c.q_dim() + 2 * c.kv_dim()],
-                att: vec![0.0; c.q_dim()],
-                scores: vec![0.0; c.num_attention_heads * model.max_seq],
-                gate_up: vec![0.0; 2 * c.intermediate_size],
+                x: vec![0.0; n * c.hidden_size],
+                xb: vec![0.0; n * c.hidden_size],
+                qkv: vec![0.0; n * (c.q_dim() + 2 * c.kv_dim())],
+                att: vec![0.0; n * c.q_dim()],
+                gate_up: vec![0.0; n * 2 * c.intermediate_size],
+                mlp: vec![0.0; n * c.intermediate_size],
                 logits: vec![0.0; c.vocab_size],
                 xq: Q8Vec::default(),
             },
@@ -217,96 +256,246 @@ impl<'m> Session<'m> {
         self.pos = 0;
     }
 
-    /// Runs one token through the model at the current position and returns the
-    /// logits for the next token.
+    /// Runs one token at the current position; returns the next-token logits.
     pub fn forward(&mut self, token: u32) -> Result<&[f32]> {
+        self.forward_batch(&[token], false)?;
+        Ok(&self.buf.logits)
+    }
+
+    /// Feeds a prompt in batches of [`PREFILL_CHUNK`] tokens; returns the logits
+    /// after its last token.
+    pub fn prefill(&mut self, tokens: &[u32]) -> Result<&[f32]> {
+        ensure!(!tokens.is_empty(), "empty prompt");
+        for chunk in tokens.chunks(PREFILL_CHUNK) {
+            self.forward_batch(chunk, false)?;
+        }
+        Ok(&self.buf.logits)
+    }
+
+    /// Runs up to [`PREFILL_CHUNK`] tokens and returns the logits after *each* of
+    /// them, `[tokens, vocab]` (used for evaluation).
+    pub fn forward_all(&mut self, tokens: &[u32]) -> Result<&[f32]> {
+        ensure!(
+            tokens.len() <= PREFILL_CHUNK,
+            "at most {PREFILL_CHUNK} tokens per call"
+        );
+        self.forward_batch(tokens, true)?;
+        Ok(&self.buf.logits)
+    }
+
+    fn forward_batch(&mut self, tokens: &[u32], all_logits: bool) -> Result<()> {
         let m = self.model;
         let c = &m.config;
+        let n = tokens.len();
+        debug_assert!((1..=PREFILL_CHUNK).contains(&n));
         ensure!(
-            self.pos < m.max_seq,
+            self.pos + n <= m.max_seq,
             "context window of {} tokens is full",
             m.max_seq
         );
-        ensure!(
-            (token as usize) < c.vocab_size,
-            "token id {token} out of range"
-        );
+        if let Some(&t) = tokens.iter().find(|&&t| t as usize >= c.vocab_size) {
+            bail!("token id {t} out of range");
+        }
 
-        let pos = self.pos;
-        let hd = c.head_dim();
-        let group = c.num_attention_heads / c.num_key_value_heads;
+        let (d, hd, heads) = (c.hidden_size, c.head_dim(), c.num_attention_heads);
+        let (q_dim, kv_dim, inter) = (c.q_dim(), c.kv_dim(), c.intermediate_size);
+        let qkv_dim = q_dim + 2 * kv_dim;
+        let n_kv = c.num_key_value_heads;
+        let group = heads / n_kv;
         let scale = 1.0 / (hd as f32).sqrt();
         let eps = c.rms_norm_eps;
         let k = kernels();
+        let pos0 = self.pos;
         let b = &mut self.buf;
+        let (x, xb) = (&mut b.x[..n * d], &mut b.xb[..n * d]);
+        let (qkv, att) = (&mut b.qkv[..n * qkv_dim], &mut b.att[..n * q_dim]);
+        let (gate_up, mlp) = (&mut b.gate_up[..n * 2 * inter], &mut b.mlp[..n * inter]);
 
-        m.embed.row(token as usize, &mut b.x);
+        for (&token, x) in tokens.iter().zip(x.chunks_exact_mut(d)) {
+            m.embed.row(token as usize, x);
+        }
+
+        // Per-token element-wise work runs in parallel over tokens (inline when n = 1).
+        let per_token = |f: &(dyn Fn(usize) + Sync)| {
+            profile::time(Section::Elementwise, || {
+                pool().par_for(n, 1, |r| r.for_each(f))
+            })
+        };
 
         for (li, layer) in m.layers.iter().enumerate() {
             // --- attention ---
-            ops::rmsnorm(&mut b.xb, &b.x, &layer.input_norm, eps);
-            layer.qkv_proj.forward(&mut b.qkv, &b.xb, &mut b.xq);
-            let (q, kv) = b.qkv.split_at_mut(c.q_dim());
-            let (keys, values) = kv.split_at_mut(c.kv_dim());
+            pool_rows2(x, d, xb, d, &per_token, |_, x, xb| {
+                ops::rmsnorm(xb, x, &layer.input_norm, eps)
+            });
+            layer.qkv_proj.forward_batch(qkv, xb, n, &mut b.xq);
 
-            for q in q.chunks_exact_mut(hd) {
-                ops::rmsnorm_inplace(q, &layer.q_norm, eps);
-                m.rope.apply(q, pos);
-            }
-            for (h, (key, v)) in keys
-                .chunks_exact_mut(hd)
-                .zip(values.chunks_exact(hd))
-                .enumerate()
-            {
-                ops::rmsnorm_inplace(key, &layer.k_norm, eps);
-                m.rope.apply(key, pos);
-                let off = self.cache.head_offset(li, h) + pos * hd;
-                self.cache.k[off..off + hd].copy_from_slice(key);
-                self.cache.v[off..off + hd].copy_from_slice(v);
-            }
+            // QK-norm and RoPE, then append K and V to the cache.
+            pool_rows(qkv, qkv_dim, &per_token, |t, row| {
+                let (q, kv) = row.split_at_mut(q_dim);
+                for (heads, norm) in [(q, &layer.q_norm), (&mut kv[..kv_dim], &layer.k_norm)] {
+                    for head in heads.chunks_exact_mut(hd) {
+                        ops::rmsnorm_inplace(head, norm, eps);
+                        m.rope.apply(head, pos0 + t);
+                    }
+                }
+            });
+            profile::time(Section::Elementwise, || {
+                for (t, row) in qkv.chunks_exact(qkv_dim).enumerate() {
+                    let (keys, values) = row[q_dim..].split_at(kv_dim);
+                    for (h, (key, v)) in keys
+                        .chunks_exact(hd)
+                        .zip(values.chunks_exact(hd))
+                        .enumerate()
+                    {
+                        self.cache.store(li, h, pos0 + t, key, v);
+                    }
+                }
+            });
 
+            // One task per (KV head, block of tokens): the query heads of a GQA group
+            // over the block share every key tile. Token t sees positions 0..=pos0 + t.
             let cache = &self.cache;
-            let q = &*q;
-            let seq = pos + 1;
-            pool().par_chunks2(
-                &mut b.att,
-                hd,
-                &mut b.scores,
-                m.max_seq,
-                |h, out, scores| {
-                    let base = cache.head_offset(li, h / group);
-                    let keys = &cache.k[base..base + seq * hd];
-                    let values = &cache.v[base..base + seq * hd];
-                    let q = &q[h * hd..][..hd];
-                    let scores = &mut scores[..seq];
-                    for (s, key) in scores.iter_mut().zip(keys.chunks_exact(hd)) {
-                        *s = (k.dot_f32)(q, key) * scale;
-                    }
-                    ops::softmax_inplace(scores);
-                    out.fill(0.0);
-                    for (&p, v) in scores.iter().zip(values.chunks_exact(hd)) {
-                        (k.axpy_f32)(out, p, v);
-                    }
-                },
-            );
+            let qkv_ro = &*qkv;
+            let att_heads = RowPtr::new(att, hd); // row t * heads + h
+            let block = (ATTENTION_BLOCK_QUERIES / group).max(1);
+            let n_blocks = n.div_ceil(block);
+            profile::time(Section::Attention, || {
+                pool().par_for(n_kv * n_blocks, 1, |tasks| {
+                    ATTENTION_SCRATCH.with_borrow_mut(|(qs, outs)| {
+                        for task in tasks {
+                            let (g, blk) = (task % n_kv, task / n_kv);
+                            let tokens = blk * block..((blk + 1) * block).min(n);
+                            let query_heads = g * group..(g + 1) * group;
+                            let mut limits = [0usize; MAX_QUERIES];
+                            let mut m = 0;
+                            for t in tokens.clone() {
+                                for h in query_heads.clone() {
+                                    qs[m * hd..][..hd]
+                                        .copy_from_slice(&qkv_ro[t * qkv_dim + h * hd..][..hd]);
+                                    limits[m] = pos0 + t + 1;
+                                    m += 1;
+                                }
+                            }
+                            let seen = pos0 + tokens.end;
+                            let base = cache.head_offset(li, g);
+                            let keys = &cache.k[base..][..seen.div_ceil(ATT_TILE) * ATT_TILE * hd];
+                            let values = &cache.v[base..][..seen * hd];
+                            (k.attention)(
+                                &qs[..m * hd],
+                                keys,
+                                values,
+                                &limits[..m],
+                                scale,
+                                &mut outs[..m * hd],
+                            );
+                            let mut i = 0;
+                            for t in tokens {
+                                for h in query_heads.clone() {
+                                    // SAFETY: each (t, h) belongs to exactly one task.
+                                    unsafe { att_heads.row(t * heads + h) }
+                                        .copy_from_slice(&outs[i * hd..][..hd]);
+                                    i += 1;
+                                }
+                            }
+                        }
+                    })
+                })
+            });
 
-            layer.o_proj.forward(&mut b.xb, &b.att, &mut b.xq);
-            ops::add_inplace(&mut b.x, &b.xb);
+            layer.o_proj.forward_batch(xb, att, n, &mut b.xq);
 
             // --- MLP (SwiGLU) ---
-            ops::rmsnorm(&mut b.xb, &b.x, &layer.post_norm, eps);
-            layer.gate_up_proj.forward(&mut b.gate_up, &b.xb, &mut b.xq);
-            let (gate, up) = b.gate_up.split_at_mut(c.intermediate_size);
-            for (g, &u) in gate.iter_mut().zip(&*up) {
-                *g = ops::silu(*g) * u;
-            }
-            layer.down_proj.forward(&mut b.xb, gate, &mut b.xq);
-            ops::add_inplace(&mut b.x, &b.xb);
+            pool_rows2(x, d, xb, d, &per_token, |_, x, xb| {
+                ops::add_inplace(x, xb);
+                ops::rmsnorm(xb, x, &layer.post_norm, eps);
+            });
+            layer.gate_up_proj.forward_batch(gate_up, xb, n, &mut b.xq);
+            pool_rows2(mlp, inter, gate_up, 2 * inter, &per_token, |_, h, gu| {
+                let (gate, up) = gu.split_at(inter);
+                for ((h, &g), &u) in h.iter_mut().zip(gate).zip(up) {
+                    *h = ops::silu(g) * u;
+                }
+            });
+            layer.down_proj.forward_batch(xb, mlp, n, &mut b.xq);
+            pool_rows2(x, d, xb, d, &per_token, |_, x, xb| ops::add_inplace(x, xb));
         }
 
-        ops::rmsnorm_inplace(&mut b.x, &m.final_norm, eps);
-        m.lm_head().forward(&mut b.logits, &b.x, &mut b.xq);
-        self.pos += 1;
-        Ok(&b.logits)
+        // Only compute the logits that are needed: the LM head is the largest matrix.
+        let head = m.lm_head();
+        let vocab = c.vocab_size;
+        if all_logits {
+            for x in x.chunks_exact_mut(d) {
+                ops::rmsnorm_inplace(x, &m.final_norm, eps);
+            }
+            b.logits.resize(n * vocab, 0.0);
+            head.forward_batch(&mut b.logits, x, n, &mut b.xq);
+        } else {
+            let last = &mut x[(n - 1) * d..];
+            ops::rmsnorm_inplace(last, &m.final_norm, eps);
+            b.logits.resize(vocab, 0.0);
+            head.forward(&mut b.logits, last, &mut b.xq);
+        }
+        self.pos += n;
+        Ok(())
+    }
+}
+
+/// Runs a per-row closure for every row index, in whatever order and threads it likes.
+type RowScheduler<'a> = dyn Fn(&(dyn Fn(usize) + Sync)) + 'a;
+
+/// Runs `f(t, row_t)` for every row of the row-major buffer `a` (row length `len`)
+/// through `run`, which decides how rows are scheduled.
+fn pool_rows(
+    a: &mut [f32],
+    len: usize,
+    run: &RowScheduler<'_>,
+    f: impl Fn(usize, &mut [f32]) + Sync,
+) {
+    let a = RowPtr::new(a, len);
+    // SAFETY: `run` calls the closure once per distinct row index.
+    run(&|t| f(t, unsafe { a.row(t) }));
+}
+
+/// Like [`pool_rows`] over two buffers with the same number of rows.
+fn pool_rows2(
+    a: &mut [f32],
+    la: usize,
+    b: &mut [f32],
+    lb: usize,
+    run: &RowScheduler<'_>,
+    f: impl Fn(usize, &mut [f32], &mut [f32]) + Sync,
+) {
+    assert_eq!(a.len() / la, b.len() / lb);
+    let (a, b) = (RowPtr::new(a, la), RowPtr::new(b, lb));
+    // SAFETY: as above.
+    run(&|t| f(t, unsafe { a.row(t) }, unsafe { b.row(t) }));
+}
+
+/// Hands out disjoint rows of a buffer to parallel tasks.
+struct RowPtr {
+    ptr: *mut f32,
+    len: usize,
+    rows: usize,
+}
+
+// SAFETY: `row` is only called for distinct rows from different threads.
+unsafe impl Sync for RowPtr {}
+
+impl RowPtr {
+    fn new(buf: &mut [f32], len: usize) -> Self {
+        assert_eq!(buf.len() % len, 0);
+        Self {
+            ptr: buf.as_mut_ptr(),
+            len,
+            rows: buf.len() / len,
+        }
+    }
+
+    /// # Safety
+    /// No two live references to the same row may exist.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn row(&self, t: usize) -> &mut [f32] {
+        assert!(t < self.rows);
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.add(t * self.len), self.len) }
     }
 }

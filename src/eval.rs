@@ -2,7 +2,10 @@
 
 use anyhow::{Result, ensure};
 
-use crate::{model::Model, sampler::argmax};
+use crate::{
+    model::{Model, PREFILL_CHUNK},
+    sampler::argmax,
+};
 
 #[derive(Debug, Clone)]
 pub struct EvalResult {
@@ -31,6 +34,7 @@ pub fn evaluate(
         tokens.len()
     );
 
+    let vocab = model.config.vocab_size;
     let mut session = model.new_session();
     let mut base_session = baseline.map(Model::new_session);
     let (mut nll, mut kl, mut agree, mut n) = (0.0, 0.0, 0usize, 0usize);
@@ -42,20 +46,31 @@ pub fn evaluate(
         if let Some(s) = &mut base_session {
             s.reset();
         }
-        for w in chunk.windows(2) {
-            let (input, target) = (w[0], w[1] as usize);
-            log_softmax(session.forward(input)?, &mut logp);
-            nll -= logp[target];
-            if let Some(s) = &mut base_session {
-                log_softmax(s.forward(input)?, &mut base_logp);
-                kl += base_logp
-                    .iter()
-                    .zip(&logp)
-                    .map(|(&b, &m)| b.exp() * (b - m))
-                    .sum::<f64>();
-                agree += (argmax_f64(&base_logp) == argmax_f64(&logp)) as usize;
+        // Every position's logits are needed, so run batches through `forward_all`.
+        let (inputs, targets) = (&chunk[..ctx - 1], &chunk[1..]);
+        for (inputs, targets) in inputs
+            .chunks(PREFILL_CHUNK)
+            .zip(targets.chunks(PREFILL_CHUNK))
+        {
+            let logits = session.forward_all(inputs)?;
+            let base_logits = match &mut base_session {
+                Some(s) => Some(s.forward_all(inputs)?),
+                None => None,
+            };
+            for (i, &target) in targets.iter().enumerate() {
+                log_softmax(&logits[i * vocab..][..vocab], &mut logp);
+                nll -= logp[target as usize];
+                if let Some(base) = base_logits {
+                    log_softmax(&base[i * vocab..][..vocab], &mut base_logp);
+                    kl += base_logp
+                        .iter()
+                        .zip(&logp)
+                        .map(|(&b, &m)| b.exp() * (b - m))
+                        .sum::<f64>();
+                    agree += (argmax_f64(&base_logp) == argmax_f64(&logp)) as usize;
+                }
+                n += 1;
             }
-            n += 1;
         }
     }
 

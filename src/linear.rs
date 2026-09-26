@@ -6,9 +6,10 @@ use anyhow::{Context, Result, bail, ensure};
 use rayon::prelude::*;
 
 use crate::{
-    kernels::kernels,
+    kernels::{QuantTile, TILE, kernels},
     pool::pool,
-    quant::{self, BLOCK, Q8Vec},
+    profile::{self, Section},
+    quant::{self, BLOCK, Q8Slice, Q8Vec},
     safetensors::{SafeTensors, bf16_to_f32, f32_to_bf16},
 };
 
@@ -153,30 +154,109 @@ impl Linear {
         }
     }
 
-    /// `out = W x`. `xq` is scratch space for the quantized activations.
+    /// `out = W x` for a single vector. `xq` is scratch for the quantized activations.
     pub fn forward(&self, out: &mut [f32], x: &[f32], xq: &mut Q8Vec) {
-        assert_eq!(out.len(), self.rows);
-        assert_eq!(x.len(), self.cols);
+        self.forward_batch(out, x, 1, xq);
+    }
+
+    /// `out[t] = W x[t]` for `n` vectors stored back to back (`x`: `[n, cols]`,
+    /// `out`: `[n, rows]`).
+    ///
+    /// For `n > 1` this is a GEMM. Each weight row is multiplied with every token while
+    /// it sits in L1, so every byte fetched from DRAM is used `n` times instead of
+    /// once, which turns the memory-bound matvec into compute-bound work.
+    pub fn forward_batch(&self, out: &mut [f32], x: &[f32], n: usize, xq: &mut Q8Vec) {
+        profile::time(Section::Matmul, || self.forward_batch_inner(out, x, n, xq));
+    }
+
+    fn forward_batch_inner(&self, out: &mut [f32], x: &[f32], n: usize, xq: &mut Q8Vec) {
+        assert_eq!(out.len(), n * self.rows);
+        assert_eq!(x.len(), n * self.cols);
         let k = kernels();
-        let (n, nb) = (self.cols, self.cols / BLOCK);
+        let (c, nb) = (self.cols, self.cols / BLOCK);
+        let gemm = |out: &mut [f32], f: &(dyn Fn(usize, usize) -> f32 + Sync)| {
+            pool().par_matrix(out, self.rows, ROWS_PER_TASK, f)
+        };
         match &self.storage {
-            Storage::F32(w) => par_rows(out, |r| (k.dot_f32)(&w[r * n..][..n], x)),
-            Storage::Bf16(w) => par_rows(out, |r| (k.dot_bf16)(&w[r * n..][..n], x)),
+            Storage::F32(w) => gemm(out, &|r, t| (k.dot_f32)(&w[r * c..][..c], &x[t * c..][..c])),
+            Storage::Bf16(w) => gemm(out, &|r, t| {
+                (k.dot_bf16)(&w[r * c..][..c], &x[t * c..][..c])
+            }),
             Storage::Q8 { qs, scales } => {
-                xq.quantize(x);
+                profile::time(Section::Quantize, || xq.quantize(x));
                 let xq = &*xq;
-                par_rows(out, |r| {
-                    (k.dot_q8)(&qs[r * n..][..n], &scales[r * nb..][..nb], xq)
+                let row = |r: usize| (&qs[r * c..][..c], &scales[r * nb..][..nb]);
+                if let Some(tile) = k.tile_q8.filter(|_| n >= TILE) {
+                    let dot = |r, t| (k.dot_q8)(row(r).0, row(r).1, xq.blocks(t * nb, nb));
+                    return self.tiled(out, n, tile, row, |t| xq.blocks(t * nb, nb), dot);
+                }
+                gemm(out, &|r, t| {
+                    (k.dot_q8)(
+                        &qs[r * c..][..c],
+                        &scales[r * nb..][..nb],
+                        xq.blocks(t * nb, nb),
+                    )
                 });
             }
             Storage::Q4 { qs, scales } => {
-                xq.quantize(x);
+                profile::time(Section::Quantize, || xq.quantize(x));
                 let xq = &*xq;
-                par_rows(out, |r| {
-                    (k.dot_q4)(&qs[r * n / 2..][..n / 2], &scales[r * nb..][..nb], xq)
+                let row = |r: usize| (&qs[r * c / 2..][..c / 2], &scales[r * nb..][..nb]);
+                if let Some(tile) = k.tile_q4.filter(|_| n >= TILE) {
+                    let dot = |r, t| (k.dot_q4)(row(r).0, row(r).1, xq.blocks(t * nb, nb));
+                    return self.tiled(out, n, tile, row, |t| xq.blocks(t * nb, nb), dot);
+                }
+                gemm(out, &|r, t| {
+                    (k.dot_q4)(
+                        &qs[r * c / 2..][..c / 2],
+                        &scales[r * nb..][..nb],
+                        xq.blocks(t * nb, nb),
+                    )
                 });
             }
         }
+    }
+
+    /// Batched matmul with a register-tiled kernel: tasks own `ROWS_PER_TASK` rows and
+    /// sweep all tokens `TILE` at a time; leftover rows/tokens use the plain dot product.
+    fn tiled<'a, W: 'a>(
+        &self,
+        out: &mut [f32],
+        n: usize,
+        tile: QuantTile<W>,
+        row: impl Fn(usize) -> (&'a [W], &'a [f32]) + Sync,
+        token: impl Fn(usize) -> Q8Slice<'a> + Sync,
+        dot: impl Fn(usize, usize) -> f32 + Sync,
+    ) {
+        pool().par_matrix_blocks(out, self.rows, ROWS_PER_TASK, |rows, set| {
+            let full_rows = rows.start + (rows.len() / TILE) * TILE;
+            for r0 in (rows.start..full_rows).step_by(TILE) {
+                let (w, ws): ([&[W]; TILE], [&[f32]; TILE]) = (
+                    std::array::from_fn(|i| row(r0 + i).0),
+                    std::array::from_fn(|i| row(r0 + i).1),
+                );
+                let mut t0 = 0;
+                while t0 + TILE <= n {
+                    let result = tile(w, ws, std::array::from_fn(|i| token(t0 + i)));
+                    for (i, per_token) in result.iter().enumerate() {
+                        for (j, &v) in per_token.iter().enumerate() {
+                            set(t0 + j, r0 + i, v);
+                        }
+                    }
+                    t0 += TILE;
+                }
+                for t in t0..n {
+                    for r in r0..r0 + TILE {
+                        set(t, r, dot(r, t));
+                    }
+                }
+            }
+            for r in full_rows..rows.end {
+                for t in 0..n {
+                    set(t, r, dot(r, t));
+                }
+            }
+        });
     }
 
     /// Dequantizes row `r` into `out` (used for embedding lookups).
@@ -207,8 +287,4 @@ impl Linear {
             Storage::Q4 { qs, scales } => qs.len() + scales.len() * 4,
         }
     }
-}
-
-fn par_rows(out: &mut [f32], f: impl Fn(usize) -> f32 + Sync) {
-    pool().par_map(out, ROWS_PER_TASK, f);
 }

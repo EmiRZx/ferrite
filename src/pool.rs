@@ -138,6 +138,79 @@ impl ThreadPool {
         });
     }
 
+    /// Fills the row-major `[n, cols]` matrix `out` with `out[t][c] = f(c, t)`, parallel
+    /// over columns in chunks of `grain` with `t` innermost. For a GEMM the columns
+    /// are weight rows: each one is used for every token while it is hot in L1. With
+    /// `grain` = 16, each task writes whole 64-byte lines of each output row.
+    pub fn par_matrix(
+        &self,
+        out: &mut [f32],
+        cols: usize,
+        grain: usize,
+        f: impl Fn(usize, usize) -> f32 + Sync,
+    ) {
+        assert_eq!(out.len() % cols, 0);
+        let n = out.len() / cols;
+        let ptr = SyncPtr(out.as_mut_ptr());
+        self.par_for(cols, grain, |range| {
+            for c in range {
+                for t in 0..n {
+                    // SAFETY: column ranges are disjoint between tasks and `t * cols + c`
+                    // is in bounds.
+                    unsafe { *ptr.get().add(t * cols + c) = f(c, t) };
+                }
+            }
+        });
+    }
+
+    /// Like [`Self::par_matrix`], but each task gets its whole column range so it can
+    /// compute tiles, and stores results through `set(t, c, value)`, which checks
+    /// that column `c` belongs to the task.
+    pub fn par_matrix_blocks(
+        &self,
+        out: &mut [f32],
+        cols: usize,
+        grain: usize,
+        f: impl Fn(Range<usize>, &dyn Fn(usize, usize, f32)) + Sync,
+    ) {
+        assert_eq!(out.len() % cols, 0);
+        let n = out.len() / cols;
+        let ptr = SyncPtr(out.as_mut_ptr());
+        self.par_for(cols, grain, |range| {
+            let set = |t: usize, c: usize, v: f32| {
+                assert!(
+                    t < n && range.contains(&c),
+                    "write outside the task's columns"
+                );
+                // SAFETY: in bounds, and no other task owns column `c`.
+                unsafe { *ptr.get().add(t * cols + c) = v };
+            };
+            f(range.clone(), &set);
+        });
+    }
+
+    /// Calls `f(i, chunk_i)` in parallel over consecutive `chunk`-sized pieces of `data`
+    /// (the last one may be shorter).
+    pub fn par_chunks_mut<T: Send>(
+        &self,
+        data: &mut [T],
+        chunk: usize,
+        f: impl Fn(usize, &mut [T]) + Sync,
+    ) {
+        let len = data.len();
+        let ptr = SyncPtr(data.as_mut_ptr());
+        self.par_for(len.div_ceil(chunk), 1, |range| {
+            for i in range {
+                let start = i * chunk;
+                // SAFETY: chunk `i` is claimed by exactly one thread and lies in bounds.
+                let piece = unsafe {
+                    std::slice::from_raw_parts_mut(ptr.get().add(start), chunk.min(len - start))
+                };
+                f(i, piece);
+            }
+        });
+    }
+
     /// Calls `f(i, a_i, b_i)` in parallel, where `a_i` / `b_i` are the `i`-th chunks
     /// of `a` / `b` of length `ca` / `cb`.
     pub fn par_chunks2<A: Send, B: Send>(
@@ -270,6 +343,18 @@ mod tests {
         let mut out = vec![0.0; 1001];
         pool.par_map(&mut out, 16, |i| i as f32);
         assert!(out.iter().enumerate().all(|(i, &v)| v == i as f32));
+
+        let mut m = vec![0.0f32; 3 * 37];
+        pool.par_matrix(&mut m, 37, 4, |c, t| (t * 100 + c) as f32);
+        assert!(
+            m.iter()
+                .enumerate()
+                .all(|(i, &v)| v == ((i / 37) * 100 + i % 37) as f32)
+        );
+
+        let mut c = vec![0usize; 23];
+        pool.par_chunks_mut(&mut c, 5, |i, chunk| chunk.fill(i));
+        assert!(c.iter().enumerate().all(|(j, &v)| v == j / 5));
 
         let (mut a, mut b) = (vec![0usize; 40], vec![0usize; 25]);
         pool.par_chunks2(&mut a, 8, &mut b, 5, |i, a, b| {

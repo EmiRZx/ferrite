@@ -6,6 +6,7 @@ pub mod linear;
 pub mod model;
 pub mod ops;
 pub mod pool;
+pub mod profile;
 pub mod quant;
 pub mod safetensors;
 pub mod sampler;

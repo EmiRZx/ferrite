@@ -68,6 +68,30 @@ fn main() -> Result<()> {
         }
     }
 
+    // Batched (prefill) matmul: gate_up_proj-sized weights times a 64-token batch.
+    let (rows, cols, n) = (6144, 1024, 64);
+    println!("\nGEMM {rows}x{cols} weights x {n} tokens (prefill shape):");
+    let w: Vec<f32> = (0..rows * cols).map(|_| rng.next_f32() - 0.5).collect();
+    let x: Vec<f32> = (0..n * cols).map(|_| rng.next_f32() - 0.5).collect();
+    let mut out = vec![0.0; n * rows];
+    let mut xq = Q8Vec::default();
+    for dtype in DType::ALL {
+        let lin = Linear::from_f32(w.clone(), rows, cols, dtype)?;
+        lin.forward_batch(&mut out, &x, n, &mut xq);
+        let iters = 20;
+        let start = Instant::now();
+        for _ in 0..iters {
+            lin.forward_batch(&mut out, black_box(&x), n, &mut xq);
+        }
+        let secs = start.elapsed().as_secs_f64() / iters as f64;
+        println!(
+            "  {:<5} {:>9.1} us/call  {:>6.1} GMAC/s",
+            dtype.to_string(),
+            secs * 1e6,
+            (rows * cols * n) as f64 / secs / 1e9
+        );
+    }
+
     println!("\nsingle-thread dot product over one 3072-wide row (in L1/L2):");
     let n = 3072;
     let a: Vec<f32> = (0..n).map(|_| rng.next_f32()).collect();

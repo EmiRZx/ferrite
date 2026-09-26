@@ -181,6 +181,8 @@ fn main() -> Result<()> {
                 if run > 0 {
                     prefill.push(stats.prefill_tok_s());
                     decode.push(stats.decode_tok_s());
+                } else {
+                    ferrite::profile::reset(); // don't count the warm-up
                 }
             }
             let (prefill, decode) = (Spread::of(prefill), Spread::of(decode));
@@ -189,6 +191,12 @@ fn main() -> Result<()> {
             println!(
                 "decode:  {decode} tok/s  ({gen_len} tokens, ~{gb_s:.1} GB/s effective weight bandwidth)"
             );
+            if ferrite::profile::enabled() {
+                println!(
+                    "time by section (timed runs):\n{}",
+                    ferrite::profile::report()
+                );
+            }
         }
         Command::Eval {
             file,

@@ -4,6 +4,7 @@
 //! table the CPU supports is picked once at startup; `FERRITE_ISA=scalar|avx2|avx512`
 //! overrides the choice (handy for benchmarking one ISA against another).
 
+pub mod attention;
 #[cfg(target_arch = "x86_64")]
 mod avx2;
 #[cfg(target_arch = "x86_64")]
@@ -14,7 +15,7 @@ use std::{fmt, str::FromStr, sync::OnceLock};
 
 use anyhow::{Result, bail};
 
-use crate::quant::{BLOCK, Q8Vec};
+use crate::quant::{BLOCK, Q8Slice};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Isa {
@@ -78,7 +79,17 @@ impl FromStr for Isa {
 
 /// Dot product of block-quantized weights `(quants, scales)` with Q8 activations.
 /// `W` is `i8` for Q8 and packed nibbles (`u8`) for Q4.
-pub type QuantDot<W> = fn(&[W], &[f32], &Q8Vec) -> f32;
+pub type QuantDot<W> = fn(&[W], &[f32], Q8Slice) -> f32;
+
+/// Multi-query attention over one KV head, see [`attention::attention_impl`]:
+/// `(queries, tiled keys, values, per-query visible lengths, scale, out)`.
+pub type AttentionFn = fn(&[f32], &[f32], &[f32], &[usize], f32, &mut [f32]);
+
+/// Rows and tokens per call of a [`QuantTile`] kernel.
+pub const TILE: usize = 4;
+
+/// `TILE` weight rows `(quants, scales)` × `TILE` tokens in one call; result `[row][token]`.
+pub type QuantTile<W> = fn([&[W]; TILE], [&[f32]; TILE], [Q8Slice; TILE]) -> [[f32; TILE]; TILE];
 
 pub struct Kernels {
     pub isa: Isa,
@@ -90,6 +101,10 @@ pub struct Kernels {
     pub dot_q4: QuantDot<u8>,
     /// Quantizes activations to Q8 (bit-identical across ISAs).
     pub quantize_q8: fn(&[f32], &mut [i8], &mut [f32]),
+    /// Register-tiled kernels for batched matmuls, where the ISA has them.
+    pub tile_q8: Option<QuantTile<i8>>,
+    pub tile_q4: Option<QuantTile<u8>>,
+    pub attention: AttentionFn,
 }
 
 static SCALAR: Kernels = Kernels {
@@ -97,9 +112,12 @@ static SCALAR: Kernels = Kernels {
     dot_f32: scalar::dot_f32,
     axpy_f32: scalar::axpy_f32,
     dot_bf16: scalar::dot_bf16,
-    dot_q8: |wq, ws, x| scalar::dot_q8(wq, ws, &x.qs, &x.scales),
-    dot_q4: |wq, ws, x| scalar::dot_q4(wq, ws, &x.qs, &x.scales),
+    dot_q8: |wq, ws, x| scalar::dot_q8(wq, ws, x.qs, x.scales),
+    dot_q4: |wq, ws, x| scalar::dot_q4(wq, ws, x.qs, x.scales),
     quantize_q8: crate::quant::quantize_q8,
+    tile_q8: None,
+    tile_q4: None,
+    attention: attention::attention_impl::<false>,
 };
 
 // SAFETY (all `unsafe` blocks below): these tables are only reachable through
@@ -110,9 +128,12 @@ static AVX2: Kernels = Kernels {
     dot_f32: |a, b| unsafe { avx2::dot_f32(a, b) },
     axpy_f32: |y, a, x| unsafe { avx2::axpy_f32(y, a, x) },
     dot_bf16: |w, x| unsafe { avx2::dot_bf16(w, x) },
-    dot_q8: |wq, ws, x| unsafe { avx2::dot_q8(wq, ws, &x.qs, &x.scales) },
-    dot_q4: |wq, ws, x| unsafe { avx2::dot_q4(wq, ws, &x.qs, &x.scales) },
+    dot_q8: |wq, ws, x| unsafe { avx2::dot_q8(wq, ws, x.qs, x.scales) },
+    dot_q4: |wq, ws, x| unsafe { avx2::dot_q4(wq, ws, x.qs, x.scales) },
     quantize_q8: |x, qs, scales| unsafe { avx2::quantize_q8(x, qs, scales) },
+    tile_q8: None,
+    tile_q4: None,
+    attention: |q, k, v, l, s, o| unsafe { avx2::attention(q, k, v, l, s, o) },
 };
 
 #[cfg(target_arch = "x86_64")]
@@ -124,6 +145,9 @@ static AVX512: Kernels = Kernels {
     dot_q8: |wq, ws, x| unsafe { avx512::dot_q8(wq, ws, x) },
     dot_q4: |wq, ws, x| unsafe { avx512::dot_q4(wq, ws, x) },
     quantize_q8: |x, qs, scales| unsafe { avx512::quantize_q8(x, qs, scales) },
+    tile_q8: Some(|w, ws, x| unsafe { avx512::tile_q8(w, ws, x) }),
+    tile_q4: Some(|w, ws, x| unsafe { avx512::tile_q4(w, ws, x) }),
+    attention: |q, k, v, l, s, o| unsafe { avx512::attention(q, k, v, l, s, o) },
 };
 
 impl Kernels {
@@ -172,7 +196,7 @@ fn check_q8(n: usize, ws: &[f32], xq: &[i8], xs: &[f32]) {
 mod tests {
     use super::*;
     use crate::{
-        quant::{quantize_q4, quantize_q8},
+        quant::{Q8Vec, quantize_q4, quantize_q8},
         sampler::Rng,
     };
 
@@ -254,8 +278,97 @@ mod tests {
                 let (mut q, mut s) = (vec![0i8; n], vec![0.0; blocks]);
                 (k.quantize_q8)(&x, &mut q, &mut s);
                 assert_eq!((&q, &s), (x8, x8s), "quantize_q8 {what}");
-                close((k.dot_q8)(&w8, &w8s, &xv), want8, &format!("dot_q8 {what}"));
-                close((k.dot_q4)(&w4, &w4s, &xv), want4, &format!("dot_q4 {what}"));
+                close(
+                    (k.dot_q8)(&w8, &w8s, xv.as_slice()),
+                    want8,
+                    &format!("dot_q8 {what}"),
+                );
+                close(
+                    (k.dot_q4)(&w4, &w4s, xv.as_slice()),
+                    want4,
+                    &format!("dot_q4 {what}"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tile_kernels_match_scalar() {
+        let mut rng = Rng::new(4);
+        for blocks in [1, 15, 16, 17, 32, 96] {
+            let n = blocks * BLOCK;
+            let mut w8 = vec![vec![0i8; n]; TILE];
+            let mut w4 = vec![vec![0u8; n / 2]; TILE];
+            let (mut s8, mut s4) = (vec![vec![0.0; blocks]; TILE], vec![vec![0.0; blocks]; TILE]);
+            for r in 0..TILE {
+                let w = random(&mut rng, n);
+                quantize_q8(&w, &mut w8[r], &mut s8[r]);
+                quantize_q4(&w, &mut w4[r], &mut s4[r]);
+            }
+            let mut xv = Q8Vec::default();
+            xv.quantize(&random(&mut rng, TILE * n));
+            let x: [Q8Slice; TILE] = std::array::from_fn(|t| xv.blocks(t * blocks, blocks));
+
+            for k in Isa::ALL.iter().filter_map(|&i| Kernels::for_isa(i)) {
+                let (Some(t8), Some(t4)) = (k.tile_q8, k.tile_q4) else {
+                    continue;
+                };
+                let got8 = t8(
+                    std::array::from_fn(|r| &w8[r][..]),
+                    std::array::from_fn(|r| &s8[r][..]),
+                    x,
+                );
+                let got4 = t4(
+                    std::array::from_fn(|r| &w4[r][..]),
+                    std::array::from_fn(|r| &s4[r][..]),
+                    x,
+                );
+                for r in 0..TILE {
+                    for t in 0..TILE {
+                        let what = format!("{} blocks={blocks} r={r} t={t}", k.isa);
+                        close(
+                            got8[r][t],
+                            scalar::dot_q8(&w8[r], &s8[r], x[t].qs, x[t].scales),
+                            &format!("tile_q8 {what}"),
+                        );
+                        close(
+                            got4[r][t],
+                            scalar::dot_q4(&w4[r], &s4[r], x[t].qs, x[t].scales),
+                            &format!("tile_q4 {what}"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn attention_kernels_match_generic() {
+        use attention::{TILE, attention_impl, key_index};
+        let mut rng = Rng::new(6);
+        for (hd, n, limits) in [
+            (128, 75, vec![1, 40, 75]),
+            (128, 200, vec![200; 7]),
+            (64, 33, vec![33, 1, 32, 20, 17]),
+            (24, 50, vec![50, 3]), // not a multiple of 16: generic fallback
+        ] {
+            let keys = random(&mut rng, n * hd);
+            let values = random(&mut rng, n * hd);
+            let q = random(&mut rng, limits.len() * hd);
+            let mut tiled = vec![0.0; n.div_ceil(TILE) * TILE * hd];
+            for pos in 0..n {
+                for d in 0..hd {
+                    tiled[key_index(pos, d, hd)] = keys[pos * hd + d];
+                }
+            }
+            let mut want = vec![0.0; q.len()];
+            attention_impl::<false>(&q, &tiled, &values, &limits, 0.2, &mut want);
+            for k in Isa::ALL.iter().filter_map(|&i| Kernels::for_isa(i)) {
+                let mut got = vec![0.0; q.len()];
+                (k.attention)(&q, &tiled, &values, &limits, 0.2, &mut got);
+                for (a, b) in got.iter().zip(&want) {
+                    close(*a, *b, &format!("attention {} hd={hd} n={n}", k.isa));
+                }
             }
         }
     }
