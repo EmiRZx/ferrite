@@ -45,7 +45,7 @@ cargo run --release --example kernels
 unchanged:
 
 ```sh
-cargo run --release -- -d q8 serve --addr 127.0.0.1:8080
+cargo run --release -- -d q8 serve --addr 127.0.0.1:8080 --max-batch 8 --kv-tokens 8192
 
 curl http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/json' -d '{
   "messages": [{"role": "user", "content": "What is the capital of France? One word."}],
@@ -58,19 +58,67 @@ uv run scripts/chat_client.py "Explain what a KV cache is."   # official `openai
 
 Supported: `POST /v1/chat/completions` with `stream` (SSE) and
 `stream_options.include_usage`, `max_tokens` / `max_completion_tokens`, `temperature`,
-`top_p`, `top_k`, `seed`, `stop`, text content parts, and
-`chat_template_kwargs.enable_thinking` for Qwen3's reasoning mode. Also `GET /v1/models` and
-`GET /health`. Errors use OpenAI's `{"error": {...}}` format, and a client that disconnects
-stops its generation.
+`top_p`, `top_k`, `seed`, `stop`, text content parts, and the vLLM extensions
+`chat_template_kwargs.enable_thinking` (Qwen3's reasoning mode) and `ignore_eos`. Also
+`GET /v1/models` and `GET /health`. Errors use OpenAI's `{"error": {...}}` format, and a
+client that disconnects stops its generation.
 
-The HTTP side (axum on a single-threaded tokio runtime) only moves bytes. A dedicated
-engine thread owns the model and KV cache, takes requests from a queue and streams text
-back over a channel per request. Stop strings are matched across token boundaries,
-holding back text that might be the start of one.
+### Continuous batching
+
+Requests are not served one after another. Every engine step is a single forward
+pass over a *ragged batch*: the next token of every running request plus up to 64
+prompt tokens of requests still in prefill (vLLM-style chunked prefill). Requests join
+and leave between steps. Decode is memory-bound, and the matmuls read each weight
+once for the whole batch, so serving 8 requests costs far less than 8 times serving one.
+
+`uv run scripts/load_test.py` (streaming requests of 128 tokens with the official
+OpenAI client, `--max-batch 16`):
+
+| concurrent requests | total tok/s | per-request tok/s | time to first token (p50) |
+|---:|---:|---:|---:|
+| 1 | 71 | 72.5 | 50 ms |
+| 2 | 124 | 64.2 | 76 ms |
+| 4 | 190 | 49.6 | 156 ms |
+| 8 | 244 | 32.2 | 234 ms |
+| 16 | 267 | 17.5 | 308 ms |
+
+Total throughput grows 3.8×. It stops scaling where the step becomes compute-bound,
+not memory-bound. `examples/kernels` shows the crossover on the LM head (Q8, weights
+streamed from DRAM):
+
+| tokens per step | 1 | 2 | 4 | 8 | 16 | 64 |
+|---|---:|---:|---:|---:|---:|---:|
+| time | 3.2 ms | 3.3 ms | 4.2 ms | 6.1 ms | 10.5 ms | 34.9 ms |
+| bound by | memory (56 GB/s) | memory | both | both | compute (238 GMAC/s) | compute (285 GMAC/s) |
+
+The second token in a step is almost free, and by 16 the int8 GEMM kernel's arithmetic
+throughput is the limit. Software-prefetching the next weight tile did not help, which
+confirms this. Making the small-batch int8 kernel cheaper per MAC is the next lever.
+
+### Paged KV cache
+
+The KV cache is one pool of 32-position pages shared by all requests (as in vLLM's
+PagedAttention, `src/kv.rs`). Each sequence keeps a page table, and the attention kernel
+reads keys and values tile by tile through it. A page is exactly one attention tile, so
+the paging is free. Requests of any length share memory without fragmentation, and
+finished requests return their pages at once.
+
+The scheduler (`src/engine.rs`) admits a waiting request when there is a free slot and
+enough pages for its tokens plus one spare page per running request. If the pool runs
+out anyway, the most recently admitted request is **preempted**: its pages are freed and
+it goes back to the front of the queue. When readmitted, its prompt and the tokens it
+already generated are recomputed in one prefill (vLLM's recompute strategy), and its
+sampler state is kept, so the client never sees a gap or a repeat.
+
+Tests pin all of this down. A ragged batch gives the same logits as running each
+sequence alone. Concurrent greedy requests produce exactly the text they produce alone.
+A deliberately undersized KV cache that forces preemptions changes nothing in the output.
 
 Options: `-d/--dtype f32|bf16|q8|q4` (default `q8`), `--threads N` (default: physical
-cores), `FERRITE_ISA=scalar|avx2|avx512` to force a kernel set, `FERRITE_PROFILE=1`
-to print where `bench` spends its time (matmul / quantize / attention / element-wise).
+cores), `--max-seq N` (context window), `FERRITE_ISA=scalar|avx2|avx512` to force a
+kernel set, `FERRITE_PROFILE=1` to print where `bench` spends its time (matmul /
+quantize / attention / element-wise). `bench --batch N` decodes N sequences in lockstep,
+as the server does.
 
 ## Results
 
@@ -229,7 +277,9 @@ query, with one rescale when a tile raises the max, so no buffer grows with the 
 - [ ] Mixed-precision Q4 (sensitive layers such as `down_proj` / `v_proj` in Q8), in the spirit of llama.cpp's Q4_K_M
 - [ ] bf16 / int8 KV cache: at 1 k tokens of context, decode drops from 68 to 55 tok/s reading the f32 cache
 - [x] **M4a**: OpenAI-compatible HTTP server with SSE streaming, stop strings, cancellation
-- [ ] **M4b**: continuous batching across requests
+- [x] **M4b**: continuous batching with chunked prefill, paged KV cache, recompute preemption, load test
+- [ ] Cheaper small-batch int8 GEMM (pre-expanded activation scales, transposed reductions): batched decode is compute-bound from ~8 tokens per step
+- [ ] Prefix caching on top of the paged KV cache (shared system prompts)
 - [ ] **M5**: comparison against llama.cpp, roofline analysis write-up
 
 ## Layout
@@ -238,7 +288,7 @@ query, with one rescale when a tile raises the max, so no buffer grows with the 
 src/
   safetensors.rs   zero-copy .safetensors reader
   tokenizer.rs     byte-level BPE (HF tokenizer.json compatible) + streaming UTF-8 decoder
-  model.rs         Qwen3 weights, KV cache, forward pass
+  model.rs         Qwen3 weights, ragged-batch forward pass, single-sequence Session
   linear.rs        linear layers over f32 / bf16 / Q8 / Q4 weights
   quant.rs         block quantization formats
   kernels/         scalar, AVX2 and AVX-512 (VNNI) kernels + runtime dispatch
@@ -248,13 +298,15 @@ src/
   ops.rs           RMSNorm, RoPE, SiLU
   sampler.rs       temperature / top-k / top-p sampling
   generate.rs      generation loop, chat template, stop-string matcher
-  engine.rs        engine thread: request queue, streaming events
+  engine.rs        continuous-batching scheduler: admission, chunked prefill, preemption
+  kv.rs            paged KV cache: shared page pool, per-sequence page tables
   server.rs        OpenAI-compatible HTTP API (axum, SSE)
   eval.rs          perplexity, KL divergence, top-1 agreement
   main.rs          CLI
 examples/kernels.rs     matvec / GEMM / bandwidth micro-benchmarks
 scripts/reference.py    dumps HF transformers outputs for the tests
 scripts/chat_client.py  streaming chat with the official OpenAI Python client
+scripts/load_test.py    throughput / latency versus concurrency
 ```
 
 ## License

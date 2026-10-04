@@ -194,11 +194,10 @@ pub fn quantize_q8(x: &[f32], qs: &mut [i8], scales: &mut [f32]) {
 #[target_feature(enable = "avx2,fma")]
 pub fn attention(
     q: &[f32],
-    keys: &[f32],
-    values: &[f32],
+    kv: &dyn super::attention::KvTiles,
     limits: &[usize],
     scale: f32,
     out: &mut [f32],
 ) {
-    super::attention::attention_impl::<true>(q, keys, values, limits, scale, out)
+    super::attention::attention_impl::<true>(q, kv, limits, scale, out)
 }

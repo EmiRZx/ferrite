@@ -3,6 +3,7 @@ pub mod engine;
 pub mod eval;
 pub mod generate;
 pub mod kernels;
+pub mod kv;
 pub mod linear;
 pub mod model;
 pub mod ops;

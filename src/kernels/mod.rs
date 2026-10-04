@@ -82,8 +82,8 @@ impl FromStr for Isa {
 pub type QuantDot<W> = fn(&[W], &[f32], Q8Slice) -> f32;
 
 /// Multi-query attention over one KV head, see [`attention::attention_impl`]:
-/// `(queries, tiled keys, values, per-query visible lengths, scale, out)`.
-pub type AttentionFn = fn(&[f32], &[f32], &[f32], &[usize], f32, &mut [f32]);
+/// `(queries, KV tiles, per-query visible lengths, scale, out)`.
+pub type AttentionFn = fn(&[f32], &dyn attention::KvTiles, &[usize], f32, &mut [f32]);
 
 /// Rows and tokens per call of a [`QuantTile`] kernel.
 pub const TILE: usize = 4;
@@ -133,7 +133,7 @@ static AVX2: Kernels = Kernels {
     quantize_q8: |x, qs, scales| unsafe { avx2::quantize_q8(x, qs, scales) },
     tile_q8: None,
     tile_q4: None,
-    attention: |q, k, v, l, s, o| unsafe { avx2::attention(q, k, v, l, s, o) },
+    attention: |q, kv, l, s, o| unsafe { avx2::attention(q, kv, l, s, o) },
 };
 
 #[cfg(target_arch = "x86_64")]
@@ -147,7 +147,7 @@ static AVX512: Kernels = Kernels {
     quantize_q8: |x, qs, scales| unsafe { avx512::quantize_q8(x, qs, scales) },
     tile_q8: Some(|w, ws, x| unsafe { avx512::tile_q8(w, ws, x) }),
     tile_q4: Some(|w, ws, x| unsafe { avx512::tile_q4(w, ws, x) }),
-    attention: |q, k, v, l, s, o| unsafe { avx512::attention(q, k, v, l, s, o) },
+    attention: |q, kv, l, s, o| unsafe { avx512::attention(q, kv, l, s, o) },
 };
 
 impl Kernels {
@@ -344,7 +344,7 @@ mod tests {
 
     #[test]
     fn attention_kernels_match_generic() {
-        use attention::{TILE, attention_impl, key_index};
+        use attention::{ContiguousTiles, attention_impl, tile_cache};
         let mut rng = Rng::new(6);
         for (hd, n, limits) in [
             (128, 75, vec![1, 40, 75]),
@@ -355,17 +355,17 @@ mod tests {
             let keys = random(&mut rng, n * hd);
             let values = random(&mut rng, n * hd);
             let q = random(&mut rng, limits.len() * hd);
-            let mut tiled = vec![0.0; n.div_ceil(TILE) * TILE * hd];
-            for pos in 0..n {
-                for d in 0..hd {
-                    tiled[key_index(pos, d, hd)] = keys[pos * hd + d];
-                }
-            }
+            let (tiled, padded) = tile_cache(&keys, &values, hd);
+            let kv = ContiguousTiles {
+                keys: &tiled,
+                values: &padded,
+                head_dim: hd,
+            };
             let mut want = vec![0.0; q.len()];
-            attention_impl::<false>(&q, &tiled, &values, &limits, 0.2, &mut want);
+            attention_impl::<false>(&q, &kv, &limits, 0.2, &mut want);
             for k in Isa::ALL.iter().filter_map(|&i| Kernels::for_isa(i)) {
                 let mut got = vec![0.0; q.len()];
-                (k.attention)(&q, &tiled, &values, &limits, 0.2, &mut got);
+                (k.attention)(&q, &kv, &limits, 0.2, &mut got);
                 for (a, b) in got.iter().zip(&want) {
                     close(*a, *b, &format!("attention {} hd={hd} n={n}", k.isa));
                 }

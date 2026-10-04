@@ -74,6 +74,9 @@ struct ChatCompletionRequest {
     n: Option<usize>,
     /// vLLM-style template options, e.g. `{"enable_thinking": true}` for Qwen3.
     chat_template_kwargs: Option<TemplateKwargs>,
+    /// vLLM extension: keep generating past end-of-sequence (for benchmarks).
+    #[serde(default)]
+    ignore_eos: bool,
 }
 
 #[derive(Deserialize)]
@@ -202,6 +205,9 @@ fn prepare(engine: &Engine, body: &[u8]) -> Result<Prepared, ApiError> {
         .or(req.max_tokens)
         .unwrap_or(room)
         .min(room);
+    if max_tokens == 0 {
+        return Err(ApiError::bad_request("max_tokens must be at least 1"));
+    }
     Ok(Prepared {
         request: Request {
             prompt,
@@ -209,6 +215,7 @@ fn prepare(engine: &Engine, body: &[u8]) -> Result<Prepared, ApiError> {
             sampling,
             seed: req.seed.unwrap_or_else(random_u64),
             stop,
+            ignore_eos: req.ignore_eos,
         },
         stream: req.stream,
         include_usage: req.stream_options.is_some_and(|o| o.include_usage),

@@ -92,6 +92,29 @@ fn main() -> Result<()> {
         );
     }
 
+    // Few-token batches (continuous-batching decode) on weights that stream from DRAM.
+    let (rows, cols) = (151_936, 1024);
+    println!("\nQ8 {rows}x{cols} (lm_head, from DRAM) x n tokens:");
+    let w: Vec<f32> = (0..rows * cols).map(|_| rng.next_f32() - 0.5).collect();
+    let lin = Linear::from_f32(w, rows, cols, DType::Q8)?;
+    for n in [1, 2, 4, 8, 16, 32, 64] {
+        let x: Vec<f32> = (0..n * cols).map(|_| rng.next_f32() - 0.5).collect();
+        let mut out = vec![0.0; n * rows];
+        lin.forward_batch(&mut out, &x, n, &mut xq);
+        let iters = 5;
+        let start = Instant::now();
+        for _ in 0..iters {
+            lin.forward_batch(&mut out, black_box(&x), n, &mut xq);
+        }
+        let secs = start.elapsed().as_secs_f64() / iters as f64;
+        println!(
+            "  n={n:<3} {:>8.2} ms  {:>6.1} GB/s  {:>6.1} GMAC/s",
+            secs * 1e3,
+            lin.bytes() as f64 / secs / 1e9,
+            (rows * cols * n) as f64 / secs / 1e9
+        );
+    }
+
     println!("\nsingle-thread dot product over one 3072-wide row (in L1/L2):");
     let n = 3072;
     let a: Vec<f32> = (0..n).map(|_| rng.next_f32()).collect();

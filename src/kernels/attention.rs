@@ -4,7 +4,8 @@
 //!
 //! Keys are stored transposed per tile of [`TILE`] positions (`[head_dim][TILE]`),
 //! so scoring one query against a whole tile is `head_dim` vector FMAs across the 32
-//! positions, with no horizontal sums. Several queries (the query heads of one GQA
+//! positions, with no horizontal sums. Tiles are fetched through [`KvTiles`], so
+//! the cache can live in non-adjacent pages. Several queries (the query heads of one GQA
 //! group, over a block of tokens) share each tile while it is in L1.
 
 /// Positions per key tile.
@@ -45,14 +46,35 @@ pub fn exp_approx(x: f32) -> f32 {
     if x < -87.0 { 0.0 } else { scaled }
 }
 
+/// Where attention reads the KV cache from: tile `i` covers positions
+/// `i * TILE .. (i + 1) * TILE`. Tiles need not be adjacent in memory, which is what
+/// lets the cache be paged.
+pub trait KvTiles: Sync {
+    /// Key tile `i`, transposed (`[head_dim][TILE]`), and value tile `i`
+    /// (`[TILE][head_dim]`).
+    fn tile(&self, i: usize) -> (&[f32], &[f32]);
+}
+
+/// A cache stored as one contiguous run of tiles.
+pub struct ContiguousTiles<'a> {
+    pub keys: &'a [f32],
+    pub values: &'a [f32],
+    pub head_dim: usize,
+}
+
+impl KvTiles for ContiguousTiles<'_> {
+    fn tile(&self, i: usize) -> (&[f32], &[f32]) {
+        let len = TILE * self.head_dim;
+        (&self.keys[i * len..][..len], &self.values[i * len..][..len])
+    }
+}
+
 /// `m = limits.len()` queries (`q`: `[m, head_dim]`) attend over one KV head. Query
-/// `i` sees positions `0..limits[i]`. `keys` is tile-transposed (see module docs),
-/// `values` is `[positions, head_dim]`, `out` is `[m, head_dim]`.
+/// `i` sees positions `0..limits[i]`. `out` is `[m, head_dim]`.
 #[inline(always)]
 pub fn attention_impl<const FMA: bool>(
     q: &[f32],
-    keys: &[f32],
-    values: &[f32],
+    kv: &dyn KvTiles,
     limits: &[usize],
     scale: f32,
     out: &mut [f32],
@@ -65,14 +87,14 @@ pub fn attention_impl<const FMA: bool>(
     let hd = q.len() / m;
     assert!(hd <= MAX_HEAD_DIM && q.len() == m * hd && out.len() == m * hd);
     let n = limits.iter().copied().max().unwrap_or(0);
-    assert!(keys.len() >= n.div_ceil(TILE) * TILE * hd && values.len() >= n * hd);
 
     let mut max = [f32::NEG_INFINITY; MAX_QUERIES];
     let mut sum = [0f32; MAX_QUERIES];
     out.fill(0.0);
 
     for (tile, j0) in (0..n).step_by(TILE).enumerate() {
-        let kt = &keys[tile * TILE * hd..][..TILE * hd];
+        let (kt, vt) = kv.tile(tile);
+        let (kt, vt) = (&kt[..TILE * hd], &vt[..TILE * hd]);
         for i in 0..m {
             let visible = limits[i].saturating_sub(j0).min(TILE);
             if visible == 0 {
@@ -102,7 +124,7 @@ pub fn attention_impl<const FMA: bool>(
                 *p = exp_approx(s - max[i]);
             }
             sum[i] += p.iter().sum::<f32>();
-            for (&p, v) in p[..visible].iter().zip(values[j0 * hd..].chunks_exact(hd)) {
+            for (&p, v) in p[..visible].iter().zip(vt.chunks_exact(hd)) {
                 for (o, &v) in o.iter_mut().zip(v) {
                     *o = madd::<FMA>(p, v, *o);
                 }
@@ -119,6 +141,22 @@ pub fn attention_impl<const FMA: bool>(
 #[inline]
 pub fn key_index(pos: usize, d: usize, head_dim: usize) -> usize {
     (pos / TILE) * TILE * head_dim + d * TILE + pos % TILE
+}
+
+/// Lays out `[positions, head_dim]` keys and values as whole tiles (keys transposed,
+/// both zero-padded to a multiple of [`TILE`] positions).
+pub fn tile_cache(keys: &[f32], values: &[f32], hd: usize) -> (Vec<f32>, Vec<f32>) {
+    let n = keys.len() / hd;
+    let len = n.div_ceil(TILE) * TILE * hd;
+    let mut tiled = vec![0.0; len];
+    for pos in 0..n {
+        for d in 0..hd {
+            tiled[key_index(pos, d, hd)] = keys[pos * hd + d];
+        }
+    }
+    let mut padded = values.to_vec();
+    padded.resize(len, 0.0);
+    (tiled, padded)
 }
 
 #[cfg(test)]
@@ -150,14 +188,14 @@ mod tests {
         let limits = [1, 31, 32, 33, 64, 75];
         let q = rand(limits.len() * hd);
 
-        let mut tiled = vec![0.0; n.div_ceil(TILE) * TILE * hd];
-        for pos in 0..n {
-            for d in 0..hd {
-                tiled[key_index(pos, d, hd)] = keys[pos * hd + d];
-            }
-        }
+        let (tiled, padded) = tile_cache(&keys, &values, hd);
+        let kv = ContiguousTiles {
+            keys: &tiled,
+            values: &padded,
+            head_dim: hd,
+        };
         let mut out = vec![0.0; q.len()];
-        attention_impl::<false>(&q, &tiled, &values, &limits, 0.3, &mut out);
+        attention_impl::<false>(&q, &kv, &limits, 0.3, &mut out);
 
         for (i, &limit) in limits.iter().enumerate() {
             let qi = &q[i * hd..][..hd];

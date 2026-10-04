@@ -150,3 +150,70 @@ fn batched_matches_sequential_for_every_dtype() {
         );
     }
 }
+
+/// One forward pass over a ragged batch (a decode token, a prompt chunk and a fresh
+/// prompt, each at a different position in its own paged KV cache) must give the
+/// same logits as running each sequence on its own.
+#[test]
+fn ragged_batch_matches_separate_sequences() {
+    use ferrite::{
+        kv::{KvPool, SeqCache},
+        model::{Span, Workspace},
+    };
+    let Some((dir, fx)) = setup() else { return };
+    let model = Model::load(&dir, 256, DType::Q8).unwrap();
+    let vocab = model.config.vocab_size;
+    let ids = &fx.prompt_ids;
+    // (tokens already in the cache, tokens in this pass)
+    let cases: [(&[u32], &[u32]); 3] = [
+        (&ids[..8], &ids[8..9]),
+        (&ids[..3], &ids[3..12]),
+        (&[], &ids[..5]),
+    ];
+
+    let mut alone = Vec::new();
+    let mut session = model.new_session();
+    for (history, step) in cases {
+        session.reset();
+        if !history.is_empty() {
+            session.prefill(history).unwrap();
+        }
+        alone.push(session.forward_all(step).unwrap().to_vec());
+    }
+
+    let mut pool = KvPool::for_tokens(&model.config, 256);
+    let mut ws = Workspace::new(&model, 64);
+    let mut seqs: Vec<SeqCache> = (0..cases.len()).map(|_| SeqCache::default()).collect();
+    for (seq, (history, step)) in seqs.iter_mut().zip(cases) {
+        pool.reserve(seq, history.len() + step.len()).unwrap();
+        if !history.is_empty() {
+            let span = Span {
+                seq,
+                tokens: history,
+                all_logits: false,
+            };
+            model.forward(&mut ws, &mut pool, &mut [span]).unwrap();
+        }
+    }
+    let mut spans: Vec<Span> = seqs
+        .iter_mut()
+        .zip(cases)
+        .map(|(seq, (_, step))| Span {
+            seq,
+            tokens: step,
+            all_logits: true,
+        })
+        .collect();
+    model.forward(&mut ws, &mut pool, &mut spans).unwrap();
+
+    for (i, want) in alone.iter().enumerate() {
+        let got = ws.logits(i, vocab);
+        assert_eq!(got.len(), want.len());
+        let err = got
+            .iter()
+            .zip(want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(err < 1e-4, "sequence {i}: ragged batch differs by {err}");
+    }
+}

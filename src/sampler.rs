@@ -49,6 +49,9 @@ impl Default for SamplingParams {
     }
 }
 
+/// Up to this many, top-k uses a single-pass selection instead of a full partition.
+const SMALL_TOP_K: usize = 128;
+
 pub struct Sampler {
     params: SamplingParams,
     rng: Rng,
@@ -72,13 +75,28 @@ impl Sampler {
 
         let c = &mut self.candidates;
         c.clear();
-        c.extend(logits.iter().enumerate().map(|(i, &l)| (l, i as u32)));
         let by_logit_desc = |a: &(f32, u32), b: &(f32, u32)| b.0.total_cmp(&a.0);
-        if p.top_k > 0 && p.top_k < c.len() {
-            c.select_nth_unstable_by(p.top_k - 1, by_logit_desc);
-            c.truncate(p.top_k);
+        if (1..=SMALL_TOP_K).contains(&p.top_k) && p.top_k < logits.len() {
+            // One pass keeping the k best in a sorted buffer: almost every logit is
+            // rejected by a single comparison with the current k-th best.
+            for (i, &l) in logits.iter().enumerate() {
+                if c.len() == p.top_k {
+                    if l <= c[p.top_k - 1].0 {
+                        continue;
+                    }
+                    c.pop();
+                }
+                let at = c.partition_point(|x| x.0 >= l);
+                c.insert(at, (l, i as u32));
+            }
+        } else {
+            c.extend(logits.iter().enumerate().map(|(i, &l)| (l, i as u32)));
+            if p.top_k > 0 && p.top_k < c.len() {
+                c.select_nth_unstable_by(p.top_k - 1, by_logit_desc);
+                c.truncate(p.top_k);
+            }
+            c.sort_unstable_by(by_logit_desc);
         }
-        c.sort_unstable_by(by_logit_desc);
 
         // Softmax over the survivors, then keep the smallest prefix with mass >= top_p.
         let max = c[0].0;
@@ -156,5 +174,25 @@ mod tests {
         let logits = [0.0, (3.0f32).ln()]; // p = [0.25, 0.75]
         let hits = (0..10_000).filter(|_| s.sample(&logits) == 1).count();
         assert!((7_200..7_800).contains(&hits), "{hits}");
+    }
+
+    #[test]
+    fn small_top_k_keeps_the_k_largest() {
+        let mut rng = Rng::new(3);
+        let logits: Vec<f32> = (0..5000).map(|_| rng.next_f32() * 10.0).collect();
+        let mut sorted: Vec<f32> = logits.clone();
+        sorted.sort_by(|a, b| b.total_cmp(a));
+        let mut s = Sampler::new(
+            SamplingParams {
+                temperature: 1.0,
+                top_k: 7,
+                top_p: 1.0,
+            },
+            1,
+        );
+        for _ in 0..200 {
+            let id = s.sample(&logits) as usize;
+            assert!(logits[id] >= sorted[6], "sampled outside the top 7");
+        }
     }
 }

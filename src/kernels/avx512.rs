@@ -411,8 +411,7 @@ unsafe fn score_queries<const G: usize>(
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx2,fma")]
 pub fn attention(
     q: &[f32],
-    keys: &[f32],
-    values: &[f32],
+    kv: &dyn super::attention::KvTiles,
     limits: &[usize],
     scale: f32,
     out: &mut [f32],
@@ -425,22 +424,25 @@ pub fn attention(
     );
     let hd = q.len() / m;
     if !hd.is_multiple_of(16) {
-        return attention_impl::<true>(q, keys, values, limits, scale, out);
+        return attention_impl::<true>(q, kv, limits, scale, out);
     }
     assert!(hd <= MAX_HEAD_DIM && q.len() == m * hd && out.len() == m * hd);
     let n = limits.iter().copied().max().unwrap_or(0);
-    assert!(keys.len() >= n.div_ceil(TILE) * TILE * hd && values.len() >= n * hd);
 
     let mut max = [f32::NEG_INFINITY; MAX_QUERIES];
     let mut sum = [0f32; MAX_QUERIES];
     out.fill(0.0);
-    let (pq, pk, pv, po) = (q.as_ptr(), keys.as_ptr(), values.as_ptr(), out.as_mut_ptr());
+    let (pq, po) = (q.as_ptr(), out.as_mut_ptr());
 
     for (tile, j0) in (0..n).step_by(TILE).enumerate() {
-        // SAFETY (all raw accesses below): indices stay within the lengths asserted
-        // above; `tile < n.div_ceil(TILE)`, `d < hd`, query rows `< m`, and value rows
-        // `< j0 + visible <= n`.
-        let kt = unsafe { pk.add(tile * TILE * hd) };
+        let (kt, vt) = kv.tile(tile);
+        assert!(
+            kt.len() >= TILE * hd && vt.len() >= TILE * hd,
+            "short KV tile"
+        );
+        // SAFETY (all raw accesses below): the tile lengths were just checked, query
+        // rows are `< m`, `d < hd`, and value rows are `< visible <= TILE`.
+        let (kt, pv) = (kt.as_ptr(), vt.as_ptr());
         let mut i0 = 0;
         while i0 < m {
             // Score up to QUERY_GROUP queries per pass over the tile.
@@ -502,7 +504,7 @@ pub fn attention(
                         }
                     });
                     for (j, &pj) in p[..visible].iter().enumerate() {
-                        let v = unsafe { pv.add((j0 + j) * hd + c0 * 16) };
+                        let v = unsafe { pv.add(j * hd + c0 * 16) };
                         let pj = _mm512_set1_ps(pj);
                         if width == 8 {
                             for (c, acc) in acc.iter_mut().enumerate() {

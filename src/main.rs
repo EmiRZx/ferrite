@@ -9,7 +9,7 @@ use std::{
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use ferrite::{
-    engine::Engine,
+    engine::{Engine, EngineConfig},
     generate::{ChatMessage, chat_prompt, generate},
     kernels::kernels,
     linear::DType,
@@ -50,6 +50,10 @@ enum Command {
         /// Repetitions; the median is reported.
         #[arg(long, default_value_t = 5)]
         runs: usize,
+        /// Decode this many sequences together per step (as the server's continuous
+        /// batching does) and report the aggregate rate.
+        #[arg(long, default_value_t = 1)]
+        batch: usize,
     },
     /// Print the token ids for a piece of text.
     Tokenize { text: String },
@@ -60,6 +64,13 @@ enum Command {
         /// Model id reported by the API (default: the model directory's name).
         #[arg(long)]
         model_name: Option<String>,
+        /// Most requests decoded together in one step (continuous batching).
+        #[arg(long, default_value_t = 8)]
+        max_batch: usize,
+        /// KV cache budget in tokens, shared by all requests (~229 KiB per token for
+        /// Qwen3-0.6B).
+        #[arg(long, default_value_t = 8192)]
+        kv_tokens: usize,
     },
     /// Perplexity on a text file, optionally with KL divergence against a baseline dtype.
     Eval {
@@ -182,10 +193,14 @@ fn main() -> Result<()> {
             prompt_len,
             gen_len,
             runs,
+            batch,
         } => {
             // A fixed, deterministic prompt of exactly `prompt_len` tokens.
             let filler = tokenizer.encode(" The quick brown fox jumps over the lazy dog.")?;
             let prompt: Vec<u32> = filler.iter().copied().cycle().take(prompt_len).collect();
+            if batch > 1 {
+                return bench_batch(&model, &prompt, batch, gen_len, runs);
+            }
             let mut sampler = Sampler::new(SamplingParams::greedy(), 0);
             let mut session = model.new_session();
             let (mut prefill, mut decode) = (Vec::new(), Vec::new());
@@ -240,13 +255,22 @@ fn main() -> Result<()> {
             }
             println!();
         }
-        Command::Serve { addr, model_name } => {
+        Command::Serve {
+            addr,
+            model_name,
+            max_batch,
+            kv_tokens,
+        } => {
             let name = model_name.unwrap_or_else(|| {
                 cli.model
                     .file_name()
                     .map_or("ferrite".into(), |n| n.to_string_lossy().into_owned())
             });
-            let engine = Engine::start(model, tokenizer);
+            let config = EngineConfig {
+                max_batch: max_batch.max(1),
+                kv_tokens,
+            };
+            let engine = Engine::start(model, tokenizer, config);
             // The HTTP side only shuffles bytes; the engine thread does the compute.
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -280,4 +304,80 @@ impl std::fmt::Display for Spread {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "{:>7.1} [{:.1}-{:.1}]", self.median, self.min, self.max)
     }
+}
+
+/// Decodes `batch` sequences in lockstep, one token each per forward pass.
+fn bench_batch(
+    model: &Model,
+    prompt: &[u32],
+    batch: usize,
+    gen_len: usize,
+    runs: usize,
+) -> Result<()> {
+    use ferrite::{
+        kv::{KvPool, SeqCache},
+        model::{Span, Workspace},
+        sampler::argmax,
+    };
+    let vocab = model.config.vocab_size;
+    let mut pool = KvPool::for_tokens(&model.config, batch * (prompt.len() + gen_len + 32));
+    let mut ws = Workspace::new(model, batch.max(prompt.len().min(64)));
+    let mut rates = Vec::new();
+    for run in 0..=runs.max(1) {
+        let mut seqs: Vec<SeqCache> = (0..batch).map(|_| SeqCache::default()).collect();
+        let mut next = vec![0u32; batch];
+        for (seq, next) in seqs.iter_mut().zip(&mut next) {
+            for chunk in prompt.chunks(64) {
+                pool.reserve(seq, seq.len() + chunk.len())?;
+                let span = Span {
+                    seq: &mut *seq,
+                    tokens: chunk,
+                    all_logits: false,
+                };
+                model.forward(&mut ws, &mut pool, &mut [span])?;
+            }
+            *next = argmax(ws.logits(0, vocab));
+        }
+        ferrite::profile::reset();
+        let start = Instant::now();
+        for _ in 0..gen_len {
+            for seq in &mut seqs {
+                pool.reserve(seq, seq.len() + 1)?;
+            }
+            let tokens: Vec<[u32; 1]> = next.iter().map(|&t| [t]).collect();
+            let mut spans: Vec<Span> = seqs
+                .iter_mut()
+                .zip(&tokens)
+                .map(|(seq, t)| Span {
+                    seq,
+                    tokens: t,
+                    all_logits: false,
+                })
+                .collect();
+            model.forward(&mut ws, &mut pool, &mut spans)?;
+            for (i, next) in next.iter_mut().enumerate() {
+                *next = argmax(ws.logits(i, vocab));
+            }
+        }
+        if run > 0 {
+            rates.push((batch * gen_len) as f64 / start.elapsed().as_secs_f64());
+        }
+        for seq in &mut seqs {
+            pool.release(seq);
+        }
+    }
+    let rate = Spread::of(rates);
+    println!(
+        "decode, batch {batch}: {rate} tok/s total, {:.1} tok/s per sequence ({gen_len} steps after a {}-token prompt)",
+        rate.median / batch as f64,
+        prompt.len()
+    );
+    if ferrite::profile::enabled() {
+        println!(
+            "time by section (last run):
+{}",
+            ferrite::profile::report()
+        );
+    }
+    Ok(())
 }
