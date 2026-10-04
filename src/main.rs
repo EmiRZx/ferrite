@@ -1,13 +1,16 @@
 use std::{
     io::Write,
+    net::SocketAddr,
     path::PathBuf,
+    sync::Arc,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use ferrite::{
-    generate::{chat_prompt, generate},
+    engine::Engine,
+    generate::{ChatMessage, chat_prompt, generate},
     kernels::kernels,
     linear::DType,
     model::Model,
@@ -50,6 +53,14 @@ enum Command {
     },
     /// Print the token ids for a piece of text.
     Tokenize { text: String },
+    /// Serve an OpenAI-compatible API (`/v1/chat/completions`, `/v1/models`).
+    Serve {
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        addr: SocketAddr,
+        /// Model id reported by the API (default: the model directory's name).
+        #[arg(long)]
+        model_name: Option<String>,
+    },
     /// Perplexity on a text file, optionally with KL divergence against a baseline dtype.
     Eval {
         file: PathBuf,
@@ -91,7 +102,7 @@ struct RunArgs {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let tokenizer = Tokenizer::load(cli.model.join("tokenizer.json"))?;
+    let tokenizer = Arc::new(Tokenizer::load(cli.model.join("tokenizer.json"))?);
 
     if let Command::Tokenize { text } = &cli.command {
         let ids = tokenizer.encode(text)?;
@@ -123,7 +134,12 @@ fn main() -> Result<()> {
             let text = if args.raw {
                 args.prompt.clone()
             } else {
-                chat_prompt(&args.prompt, args.system.as_deref(), args.think)
+                let mut messages = Vec::new();
+                if let Some(system) = &args.system {
+                    messages.push(ChatMessage::new("system", system.as_str()));
+                }
+                messages.push(ChatMessage::new("user", args.prompt.as_str()));
+                chat_prompt(&messages, args.think)
             };
             let prompt = tokenizer.encode(&text)?;
             let seed = args.seed.unwrap_or_else(|| {
@@ -223,6 +239,19 @@ fn main() -> Result<()> {
                 );
             }
             println!();
+        }
+        Command::Serve { addr, model_name } => {
+            let name = model_name.unwrap_or_else(|| {
+                cli.model
+                    .file_name()
+                    .map_or("ferrite".into(), |n| n.to_string_lossy().into_owned())
+            });
+            let engine = Engine::start(model, tokenizer);
+            // The HTTP side only shuffles bytes; the engine thread does the compute.
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(ferrite::server::serve(engine, &name, addr))?;
         }
         Command::Tokenize { .. } => unreachable!(),
     }

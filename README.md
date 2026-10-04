@@ -39,6 +39,35 @@ cargo run --release -- -d q4 eval models/wikitext-2-test.txt --baseline f32
 cargo run --release --example kernels
 ```
 
+## Serving
+
+`ferrite serve` exposes an OpenAI-compatible API, so existing clients and tools work
+unchanged:
+
+```sh
+cargo run --release -- -d q8 serve --addr 127.0.0.1:8080
+
+curl http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/json' -d '{
+  "messages": [{"role": "user", "content": "What is the capital of France? One word."}],
+  "temperature": 0
+}'
+# {"choices":[{"finish_reason":"stop","index":0,"message":{"content":"Paris.","role":"assistant"}}], ...}
+
+uv run scripts/chat_client.py "Explain what a KV cache is."   # official `openai` client, streaming
+```
+
+Supported: `POST /v1/chat/completions` with `stream` (SSE) and
+`stream_options.include_usage`, `max_tokens` / `max_completion_tokens`, `temperature`,
+`top_p`, `top_k`, `seed`, `stop`, text content parts, and
+`chat_template_kwargs.enable_thinking` for Qwen3's reasoning mode. Also `GET /v1/models` and
+`GET /health`. Errors use OpenAI's `{"error": {...}}` format, and a client that disconnects
+stops its generation.
+
+The HTTP side (axum on a single-threaded tokio runtime) only moves bytes. A dedicated
+engine thread owns the model and KV cache, takes requests from a queue and streams text
+back over a channel per request. Stop strings are matched across token boundaries,
+holding back text that might be the start of one.
+
 Options: `-d/--dtype f32|bf16|q8|q4` (default `q8`), `--threads N` (default: physical
 cores), `FERRITE_ISA=scalar|avx2|avx512` to force a kernel set, `FERRITE_PROFILE=1`
 to print where `bench` spends its time (matmul / quantize / attention / element-wise).
@@ -199,7 +228,8 @@ query, with one rescale when a tile raises the max, so no buffer grows with the 
 - [x] **M3**: batched prefill: tiled VNNI GEMM, FlashAttention-style tiled attention, parallel element-wise ops, profiler
 - [ ] Mixed-precision Q4 (sensitive layers such as `down_proj` / `v_proj` in Q8), in the spirit of llama.cpp's Q4_K_M
 - [ ] bf16 / int8 KV cache: at 1 k tokens of context, decode drops from 68 to 55 tok/s reading the f32 cache
-- [ ] **M4**: OpenAI-compatible HTTP server with streaming
+- [x] **M4a**: OpenAI-compatible HTTP server with SSE streaming, stop strings, cancellation
+- [ ] **M4b**: continuous batching across requests
 - [ ] **M5**: comparison against llama.cpp, roofline analysis write-up
 
 ## Layout
@@ -217,11 +247,14 @@ src/
   profile.rs       opt-in per-section timing (FERRITE_PROFILE=1)
   ops.rs           RMSNorm, RoPE, SiLU
   sampler.rs       temperature / top-k / top-p sampling
-  generate.rs      generation loop, chat template
+  generate.rs      generation loop, chat template, stop-string matcher
+  engine.rs        engine thread: request queue, streaming events
+  server.rs        OpenAI-compatible HTTP API (axum, SSE)
   eval.rs          perplexity, KL divergence, top-1 agreement
   main.rs          CLI
 examples/kernels.rs     matvec / GEMM / bandwidth micro-benchmarks
 scripts/reference.py    dumps HF transformers outputs for the tests
+scripts/chat_client.py  streaming chat with the official OpenAI Python client
 ```
 
 ## License

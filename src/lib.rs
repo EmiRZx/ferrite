@@ -1,4 +1,5 @@
 pub mod config;
+pub mod engine;
 pub mod eval;
 pub mod generate;
 pub mod kernels;
@@ -10,4 +11,5 @@ pub mod profile;
 pub mod quant;
 pub mod safetensors;
 pub mod sampler;
+pub mod server;
 pub mod tokenizer;

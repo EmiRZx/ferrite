@@ -8,6 +8,8 @@ readme = "README.md"
 
 [dependencies]
 anyhow = "1"
+async-stream = "0.3.6"
+axum = "0.8.9"
 clap = { version = "4", features = ["derive"] }
 fancy-regex = "0.19"
 memmap2 = "0.9"
@@ -16,6 +18,7 @@ rayon = "1"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "net", "sync"] }
 unicode-normalization = "0.1"
 
 [profile.release]
@@ -26,3 +29,6 @@ debug = "line-tables-only"
 [lints.clippy]
 # `chunks_exact(BLOCK)` reads better than `as_chunks::<BLOCK>().0.iter()` in the block loops.
 chunks_exact_to_as_chunks = "allow"
+
+[dev-dependencies]
+tower = { version = "0.5.3", features = ["util"] }
