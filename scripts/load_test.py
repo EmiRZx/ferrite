@@ -40,13 +40,16 @@ async def one(client, model, prompt, max_tokens):
         temperature=0.7,
         stream=True,
         stream_options={"include_usage": True},
-        extra_body={"ignore_eos": True},
+        # Same prompt format on every server: Qwen3 with thinking off.
+        extra_body={"ignore_eos": True, "chat_template_kwargs": {"enable_thinking": False}},
     )
     async for chunk in stream:
         if chunk.usage:
             tokens = chunk.usage.completion_tokens
-        elif chunk.choices and chunk.choices[0].delta.content and first is None:
-            first = time.perf_counter()
+        elif chunk.choices and first is None:
+            delta = chunk.choices[0].delta
+            if delta.content or getattr(delta, "reasoning_content", None):
+                first = time.perf_counter()
     end = time.perf_counter()
     decode_rate = (tokens - 1) / (end - first) if first and end > first else 0.0
     return first - start, decode_rate, tokens

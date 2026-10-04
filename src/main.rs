@@ -84,6 +84,10 @@ enum Command {
         /// Compare against the same model loaded in this format (e.g. f32).
         #[arg(long)]
         baseline: Option<DType>,
+        /// Only score predictions from this position of each window on; `ctx / 2`
+        /// matches llama.cpp's `llama-perplexity`.
+        #[arg(long, default_value_t = 0)]
+        score_from: usize,
     },
 }
 
@@ -234,13 +238,21 @@ fn main() -> Result<()> {
             ctx,
             chunks,
             baseline,
+            score_from,
         } => {
             let text = std::fs::read_to_string(&file)?;
             let tokens = tokenizer.encode(&text)?;
             let baseline = baseline
                 .map(|dtype| Model::load(&cli.model, ctx, dtype))
                 .transpose()?;
-            let r = ferrite::eval::evaluate(&model, baseline.as_ref(), &tokens, ctx, chunks)?;
+            let r = ferrite::eval::evaluate(
+                &model,
+                baseline.as_ref(),
+                &tokens,
+                ctx,
+                chunks,
+                score_from,
+            )?;
             print!(
                 "{}: ppl {:.3} over {} tokens",
                 model.dtype(),

@@ -21,6 +21,7 @@ out = sys.argv[1] if len(sys.argv) > 1 else "models/wikitext-2-test.txt"
 
 data = urllib.request.urlopen(URL).read()
 lines = pq.read_table(io.BytesIO(data)).column("text").to_pylist()
-with open(out, "w", encoding="utf-8") as f:
-    f.write("".join(lines))
+# Write the text byte for byte: in text mode, Windows would turn every LF into CRLF.
+with open(out, "wb") as f:
+    f.write("".join(lines).encode("utf-8"))
 print(f"wrote {out} ({len(lines)} lines)")

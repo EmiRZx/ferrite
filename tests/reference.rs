@@ -20,6 +20,8 @@ struct Fixture {
     prompt_ids: Vec<u32>,
     positions: Vec<TopK>,
     greedy: Vec<u32>,
+    long_ids: Vec<u32>,
+    long_positions: Vec<TopK>,
 }
 
 #[derive(Deserialize)]
@@ -216,4 +218,34 @@ fn ragged_batch_matches_separate_sequences() {
             .fold(0f32, f32::max);
         assert!(err < 1e-4, "sequence {i}: ragged batch differs by {err}");
     }
+}
+
+/// A ~300-token text, fed in prefill chunks: crosses many attention tiles, KV pages
+/// and chunk boundaries, which the short prompt above does not.
+#[test]
+fn long_context_matches_hf() {
+    let Some((dir, fx)) = setup() else { return };
+    let model = Model::load(&dir, 512, DType::F32).unwrap();
+    let vocab = model.config.vocab_size;
+    let mut session = model.new_session();
+    let mut max_err = 0f32;
+    let mut pos = 0;
+    for chunk in fx.long_ids.chunks(ferrite::model::PREFILL_CHUNK) {
+        let logits = session.forward_all(chunk).unwrap().to_vec();
+        for (i, expected) in fx.long_positions[pos..pos + chunk.len()].iter().enumerate() {
+            let row = &logits[i * vocab..][..vocab];
+            assert_eq!(
+                ferrite::sampler::argmax(row),
+                expected.ids[0],
+                "argmax differs at {}",
+                pos + i
+            );
+            for (&id, &want) in expected.ids.iter().zip(&expected.logits) {
+                max_err = max_err.max((row[id as usize] - want).abs());
+            }
+        }
+        pos += chunk.len();
+    }
+    eprintln!("long context ({pos} tokens): max |logit - reference| = {max_err:.2e}");
+    assert!(max_err < 1e-2, "long-context logits drifted: {max_err}");
 }

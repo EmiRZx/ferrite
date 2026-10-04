@@ -18,15 +18,19 @@ pub struct EvalResult {
 }
 
 /// Scores `chunks` non-overlapping windows of `ctx` tokens. Each window starts from
-/// an empty KV cache; its first token is context only.
+/// an empty KV cache, and only predictions made at positions `>= score_from` count
+/// (the earlier tokens are context only). `score_from = ctx / 2` reproduces
+/// llama.cpp's `llama-perplexity`.
 pub fn evaluate(
     model: &Model,
     baseline: Option<&Model>,
     tokens: &[u32],
     ctx: usize,
     chunks: usize,
+    score_from: usize,
 ) -> Result<EvalResult> {
     ensure!(ctx >= 2, "context must be at least 2 tokens");
+    ensure!(score_from < ctx - 1, "nothing left to score");
     ensure!(
         tokens.len() >= ctx * chunks,
         "need {} tokens, text has {}",
@@ -48,9 +52,10 @@ pub fn evaluate(
         }
         // Every position's logits are needed, so run batches through `forward_all`.
         let (inputs, targets) = (&chunk[..ctx - 1], &chunk[1..]);
-        for (inputs, targets) in inputs
+        for (batch, (inputs, targets)) in inputs
             .chunks(PREFILL_CHUNK)
             .zip(targets.chunks(PREFILL_CHUNK))
+            .enumerate()
         {
             let logits = session.forward_all(inputs)?;
             let base_logits = match &mut base_session {
@@ -58,6 +63,9 @@ pub fn evaluate(
                 None => None,
             };
             for (i, &target) in targets.iter().enumerate() {
+                if batch * PREFILL_CHUNK + i < score_from {
+                    continue;
+                }
                 log_softmax(&logits[i * vocab..][..vocab], &mut logp);
                 nll -= logp[target as usize];
                 if let Some(base) = base_logits {

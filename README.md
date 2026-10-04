@@ -127,18 +127,40 @@ streaming read: ~50 GB/s), Windows 11. Greedy decoding, 8 threads.
 
 | weights | size | prefill tok/s | decode tok/s | weight bandwidth | WikiText-2 ppl | KL vs f32 | top-1 agreement |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| f32 | 2274 MiB | 194 | 20.9 | 49.9 GB/s | 29.19 | – | – |
-| bf16 | 1137 MiB | 223 | 40.3 | 48.0 GB/s | 29.19 | 0.000 | 100% |
-| Q8 | 639 MiB | 449 | 67.3 | 45.1 GB/s | 29.07 | 0.003 | 96.9% |
-| Q4 (head in Q8) | 429 MiB | 433 | 85.0 | 38.3 GB/s | 32.99 | 0.189 | 76.1% |
+| f32 | 2274 MiB | 194 | 20.9 | 49.9 GB/s | 28.10 | – | – |
+| bf16 | 1137 MiB | 223 | 40.3 | 48.0 GB/s | 28.10 | 0.000 | 100% |
+| Q8 | 639 MiB | 449 | 67.3 | 45.1 GB/s | 27.98 | 0.003 | 96.7% |
+| Q4 (head in Q8) | 429 MiB | 433 | 85.0 | 38.3 GB/s | 31.46 | 0.186 | 75.8% |
 
 Prefill: 512-token prompt. Decode: 128 tokens after a short prompt. Both are medians of
 repeated runs. This is a laptop, so expect ±10–30% between sessions depending on heat.
-Quality: 4 windows of 512 tokens from the WikiText-2 test set.
+Quality: 4 windows of 512 tokens from the WikiText-2 test set, every position scored.
+Hugging Face `transformers` (fp32) gives the same 28.10 on these tokens.
 bf16 is bit-identical to f32 because the checkpoint *is* bf16. Q8 is effectively
 lossless. Q4 costs real quality on a model this small. Choosing each block's scale by
-least-squares search instead of max-scaling cut KL from 0.210 to 0.189. Mixed precision
-for sensitive layers is next (see roadmap).
+least-squares search instead of max-scaling cuts KL by ~10%, and ferrite's Q4 ends up
+13% closer to the unquantized model than llama.cpp's Q4_0 (below). Mixed precision for
+sensitive layers is on the roadmap.
+
+## Comparison with llama.cpp
+
+Same machine, same checkpoint (converted to GGUF with llama.cpp's own script), matching
+quantization formats, each engine at its best thread count and settings. Full method,
+serving results and analysis: [docs/llama-cpp-comparison.md](docs/llama-cpp-comparison.md).
+
+| weights | prefill (pp512) | decode (tg128) | KL to unquantized |
+|---|---:|---:|---:|
+| bf16 | 0.19-0.25× | 1.05× | – |
+| Q8 | 0.96-1.06× | 0.97× | 0.0029 vs 0.0026 |
+| Q4 | 0.36-0.56× | 0.91× | **0.179 vs 0.206** |
+
+(ferrite relative to llama.cpp b11393 with its Zen 4 backend.) Decode, Q8 prefill and
+serving throughput are on par: both engines run into the same memory wall and use the
+same VNNI instructions. llama.cpp is well ahead on bf16 prefill (it uses AVX512-BF16
+`vdpbf16ps`, ferrite has no bf16 GEMM kernel) and on Q4 prefill (it repacks Q4_0 into a
+GEMM-friendly layout at load time). ferrite's Q4 quantizes more accurately. The
+comparison also caught a bug in this repo's data pipeline (CRLF line endings, see the
+write-up), which led to a long-context reference test.
 
 ## How it got fast
 
@@ -214,6 +236,8 @@ checks ferrite against them:
 | tokenizer (12 cases: Unicode, NFC, code, whitespace, special tokens) | exact match |
 | max \|logit − reference\| over top-10 logits at every prompt position | 4.8e-5 |
 | same, through the batched prefill path | 4.8e-5 |
+| same over a 266-token text (9 KV pages, 5 prefill chunks) | 8.6e-5 |
+| WikiText-2 perplexity vs `transformers` fp32 (`scripts/reference_ppl.py`) | 28.097 vs 28.097 |
 | 32-token greedy continuation | exact match |
 | batched vs token-by-token logits for bf16 / Q8 / Q4 | bit-identical |
 
@@ -280,7 +304,8 @@ query, with one rescale when a tile raises the max, so no buffer grows with the 
 - [x] **M4b**: continuous batching with chunked prefill, paged KV cache, recompute preemption, load test
 - [ ] Cheaper small-batch int8 GEMM (pre-expanded activation scales, transposed reductions): batched decode is compute-bound from ~8 tokens per step
 - [ ] Prefix caching on top of the paged KV cache (shared system prompts)
-- [ ] **M5**: comparison against llama.cpp, roofline analysis write-up
+- [x] **M5**: comparison against llama.cpp: speed, quality, serving ([write-up](docs/llama-cpp-comparison.md))
+- [ ] f16 block scales (6-11% fewer bytes per token), bf16 GEMM with `vdpbf16ps`, repacked Q4 for prefill: the gaps the comparison found
 
 ## Layout
 
@@ -307,6 +332,9 @@ examples/kernels.rs     matvec / GEMM / bandwidth micro-benchmarks
 scripts/reference.py    dumps HF transformers outputs for the tests
 scripts/chat_client.py  streaming chat with the official OpenAI Python client
 scripts/load_test.py    throughput / latency versus concurrency
+scripts/reference_ppl.py      perplexity with transformers, scored like `ferrite eval`
+scripts/compare_llamacpp.py   speed comparison with llama.cpp (alternating rounds)
+docs/llama-cpp-comparison.md  method, results and analysis of the comparison
 ```
 
 ## License

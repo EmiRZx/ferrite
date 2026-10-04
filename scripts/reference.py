@@ -38,6 +38,29 @@ PROMPT = (
 GREEDY_TOKENS = 32
 TOP_K = 10
 
+# A long, public-domain text (the opening of the US Declaration of Independence) for
+# checking long contexts: ~300 tokens span many attention tiles, KV pages and
+# prefill chunks.
+LONG_TEXT = (
+    "When in the Course of human events, it becomes necessary for one people to dissolve "
+    "the political bands which have connected them with another, and to assume among the "
+    "powers of the earth, the separate and equal station to which the Laws of Nature and of "
+    "Nature's God entitle them, a decent respect to the opinions of mankind requires that "
+    "they should declare the causes which impel them to the separation.\n\n"
+    "We hold these truths to be self-evident, that all men are created equal, that they are "
+    "endowed by their Creator with certain unalienable Rights, that among these are Life, "
+    "Liberty and the pursuit of Happiness.--That to secure these rights, Governments are "
+    "instituted among Men, deriving their just powers from the consent of the governed, "
+    "--That whenever any Form of Government becomes destructive of these ends, it is the "
+    "Right of the People to alter or to abolish it, and to institute new Government, laying "
+    "its foundation on such principles and organizing its powers in such form, as to them "
+    "shall seem most likely to effect their Safety and Happiness. Prudence, indeed, will "
+    "dictate that Governments long established should not be changed for light and "
+    "transient causes; and accordingly all experience hath shewn, that mankind are more "
+    "disposed to suffer, while evils are sufferable, than to right themselves by abolishing "
+    "the forms to which they are accustomed."
+)
+
 tok = AutoTokenizer.from_pretrained(model_dir)
 model = AutoModelForCausalLM.from_pretrained(model_dir, dtype=torch.float32)
 model.eval()
@@ -58,11 +81,20 @@ with torch.no_grad():
         top_k=None,
     )[0, len(prompt_ids):].tolist()
 
-# Top-k logits at every prompt position.
-positions = []
-for row in logits:
-    values, ids = row.topk(TOP_K)
-    positions.append({"ids": ids.tolist(), "logits": values.tolist()})
+def top_k(rows):
+    """Top-k ids and logits at every position."""
+    out = []
+    for row in rows:
+        values, ids = row.topk(TOP_K)
+        out.append({"ids": ids.tolist(), "logits": values.tolist()})
+    return out
+
+
+positions = top_k(logits)
+
+long_ids = tok.encode(LONG_TEXT, add_special_tokens=False)
+with torch.no_grad():
+    long_logits = model(torch.tensor([long_ids])).logits[0]
 
 out = {
     "model": model_dir,
@@ -71,7 +103,10 @@ out = {
     "prompt_ids": prompt_ids,
     "positions": positions,
     "greedy": generated,
+    "long_ids": long_ids,
+    "long_positions": top_k(long_logits),
 }
-with open(out_path, "w", encoding="utf-8") as f:
+with open(out_path, "w", encoding="utf-8", newline="\n") as f:  # no CRLF on Windows
     json.dump(out, f, ensure_ascii=False, indent=1)
-print(f"wrote {out_path}: {len(prompt_ids)} prompt tokens, greedy -> {tok.decode(generated)!r}")
+print(f"wrote {out_path}: {len(prompt_ids)} prompt tokens, {len(long_ids)} long-context tokens, "
+      f"greedy -> {tok.decode(generated)!r}")
