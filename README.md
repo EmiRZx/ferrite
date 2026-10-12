@@ -13,7 +13,7 @@ and document *why* each optimization works along the way.
 
 ```text
 $ ferrite -d q4 run "What is the capital of France? Answer in one sentence." -t 0
-loaded models/qwen3-0.6b as q4 in 4.08s (429 MiB of weights, avx512 kernels, 8 threads)
+loaded models/qwen3-0.6b as q4 in 3.69s (394 MiB of weights, avx512 kernels, 8 threads)
 The capital of France is Paris.
 ```
 
@@ -127,13 +127,14 @@ streaming read: ~50 GB/s), Windows 11. Greedy decoding, 8 threads.
 
 | weights | size | prefill tok/s | decode tok/s | weight bandwidth | WikiText-2 ppl | KL vs f32 | top-1 agreement |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| f32 | 2274 MiB | 194 | 20.9 | 49.9 GB/s | 28.10 | – | – |
-| bf16 | 1137 MiB | 223 | 40.3 | 48.0 GB/s | 28.10 | 0.000 | 100% |
-| Q8 | 639 MiB | 449 | 67.3 | 45.1 GB/s | 27.98 | 0.003 | 96.7% |
-| Q4 (head in Q8) | 429 MiB | 433 | 85.0 | 38.3 GB/s | 31.46 | 0.186 | 75.8% |
+| f32 | 2274 MiB | 194 | 21.0 | 50.1 GB/s | 28.10 | – | – |
+| bf16 | 1137 MiB | 250 | 42.7 | 50.9 GB/s | 28.10 | 0.000 | 100% |
+| Q8 | 604 MiB | 471 | 71.7 | 45.4 GB/s | 27.97 | 0.003 | 96.7% |
+| Q4 (head in Q8) | 394 MiB | 457 | 102.1 | 42.2 GB/s | 31.56 | 0.188 | 76.0% |
 
-Prefill: 512-token prompt. Decode: 128 tokens after a short prompt. Both are medians of
-repeated runs. This is a laptop, so expect ±10–30% between sessions depending on heat.
+Prefill: 512-token prompt. Decode: 128 tokens from an empty context. Medians of three
+rounds over all formats; this is a laptop, and the same test can move ±20% within
+minutes as it heats up.
 Quality: 4 windows of 512 tokens from the WikiText-2 test set, every position scored.
 Hugging Face `transformers` (fp32) gives the same 28.10 on these tokens.
 bf16 is bit-identical to f32 because the checkpoint *is* bf16. Q8 is effectively
@@ -151,8 +152,8 @@ serving results and analysis: [docs/llama-cpp-comparison.md](docs/llama-cpp-comp
 | weights | prefill (pp512) | decode (tg128) | KL to unquantized |
 |---|---:|---:|---:|
 | bf16 | 0.19-0.25× | 1.05× | – |
-| Q8 | 0.96-1.06× | 0.97× | 0.0029 vs 0.0026 |
-| Q4 | 0.36-0.56× | 0.91× | **0.179 vs 0.206** |
+| Q8 | 0.96-1.06× | 1.03× | 0.0025 vs 0.0026 |
+| Q4 | 0.36-0.56× | 0.94× | **0.181 vs 0.206** |
 
 (ferrite relative to llama.cpp b11393 with its Zen 4 backend.) Decode, Q8 prefill and
 serving throughput are on par: both engines run into the same memory wall and use the
@@ -248,9 +249,11 @@ coverage, disjoint writes and panic propagation.
 ## Design notes
 
 **Quantization formats** (`src/quant.rs`). Rows are split into blocks of 32 values
-with one f32 scale each, stored struct-of-arrays so kernels stream quants and scales linearly.
-Q8 stores `round(w / d)` in `[-127, 127]` (1.125 bytes/weight). Q4 stores 4-bit values
-with the block's largest-magnitude weight mapped exactly to -8 (0.625 bytes/weight).
+with one f16 scale each, stored struct-of-arrays so kernels stream quants and scales linearly.
+Q8 stores `round(w / d)` in `[-127, 127]` (1.0625 bytes/weight). Q4 stores 4-bit values
+on a grid chosen by least-squares search (0.5625 bytes/weight). The scales started out
+as f32. Switching to f16 (converted 16 at a time with `vcvtph2ps`) cut 6% / 8% of the
+bytes per token, which the llama.cpp comparison had pointed at.
 In Q4 mode the embedding / LM head (26% of all parameters) stays Q8.
 
 **Integer dot products** (`src/kernels/`). Activations are quantized to Q8 on the fly
@@ -305,7 +308,8 @@ query, with one rescale when a tile raises the max, so no buffer grows with the 
 - [ ] Cheaper small-batch int8 GEMM (pre-expanded activation scales, transposed reductions): batched decode is compute-bound from ~8 tokens per step
 - [ ] Prefix caching on top of the paged KV cache (shared system prompts)
 - [x] **M5**: comparison against llama.cpp: speed, quality, serving ([write-up](docs/llama-cpp-comparison.md))
-- [ ] f16 block scales (6-11% fewer bytes per token), bf16 GEMM with `vdpbf16ps`, repacked Q4 for prefill: the gaps the comparison found
+- [x] f16 block scales: Q8 decode now 1.03× llama.cpp, Q4 0.94×
+- [ ] bf16 GEMM with `vdpbf16ps`, repacked Q4 for prefill: the remaining gaps the comparison found
 
 ## Layout
 

@@ -21,9 +21,10 @@ engine, on the same machine, the same weights and the same quantization formats?
 | `q4` | `Q4_0 --output-tensor-type q8_0` | 4-bit, blocks of 32 | 8-bit | 0.625 / 0.5625 |
 
 The formats are the same idea (symmetric blocks of 32 with one scale each), with one
-difference: llama.cpp stores the scale as f16, ferrite as f32. ferrite therefore moves
-~6% (Q8) and ~11% (Q4) more bytes per token. Both keep the LM head in 8-bit for Q4,
-so per-token weight traffic is otherwise the same.
+difference: llama.cpp stores the scale as f16, ferrite (at the time of the main
+measurements) as f32. ferrite therefore moved ~6% (Q8) and ~11% (Q4) more bytes per
+token. Both keep the LM head in 8-bit for Q4, so per-token weight traffic is otherwise
+the same. ferrite has since switched to f16 scales; see the update at the end.
 
 ## Method
 
@@ -143,10 +144,26 @@ pages and 5 prefill chunks, and its logits match `transformers` to 8.6e-5.
 
 In order of payoff per effort:
 
-1. **f16 block scales**: 6-11% fewer bytes per token, which closes the Q4 decode gap.
+1. ~~**f16 block scales**: 6-11% fewer bytes per token.~~ Done, see below.
 2. **bf16 GEMM with `vdpbf16ps`**: the 4-5× bf16 prefill gap.
 3. **Repacked Q4 layout** for prefill: the 2-3× Q4 prefill gap.
 4. **SMT-aware scheduling** for compute-bound regions, so 16-thread prefill is stable.
+
+## Update: f16 block scales
+
+ferrite now stores weight scales as f16, like llama.cpp. AVX-512 converts 16 at a
+time with `vcvtph2ps`, and AVX2 uses F16C. Its bytes per token now match llama.cpp's
+(Q8: 604 MiB, Q4: 394 MiB). Decode re-measured the same way (3 alternating rounds):
+
+| weights | ferrite tg128 | llama.cpp tg128 | before | after |
+|---|---:|---:|---:|---:|
+| Q8 | 77.4 | 75.0 | 0.97× | **1.03×** |
+| Q4 | 104.1 | 110.9 | 0.91× | **0.94×** |
+
+Quality is unchanged: Q8 KL 0.0025, Q4 KL 0.181 (second-half scoring as above). With
+equal bytes, the remaining Q4 gap comes from the kernel. ferrite's Q4 decode reaches
+42 GB/s against 45 GB/s for Q8, because unpacking nibbles costs instructions even when
+the loop waits on memory.
 
 ## Reproducing
 

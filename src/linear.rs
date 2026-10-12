@@ -53,8 +53,8 @@ impl FromStr for DType {
 enum Storage {
     F32(Vec<f32>),
     Bf16(Vec<u16>),
-    Q8 { qs: Vec<i8>, scales: Vec<f32> },
-    Q4 { qs: Vec<u8>, scales: Vec<f32> },
+    Q8 { qs: Vec<i8>, scales: Vec<u16> },
+    Q4 { qs: Vec<u8>, scales: Vec<u16> },
 }
 
 /// A weight matrix stored row-major as `[rows, cols]` (the `nn.Linear` layout).
@@ -121,16 +121,16 @@ impl Linear {
             DType::Bf16 => Storage::Bf16(w.iter().map(|&v| f32_to_bf16(v)).collect()),
             DType::Q8 => {
                 let mut qs = vec![0i8; rows * cols];
-                let mut scales = vec![0.0; rows * cols / BLOCK];
+                let mut scales = vec![0u16; rows * cols / BLOCK];
                 qs.par_chunks_mut(cols)
                     .zip(scales.par_chunks_mut(cols / BLOCK))
                     .zip(w.par_chunks(cols))
-                    .for_each(|((q, s), w)| quant::quantize_q8(w, q, s));
+                    .for_each(|((q, s), w)| quant::quantize_q8_weights(w, q, s));
                 Storage::Q8 { qs, scales }
             }
             DType::Q4 => {
                 let mut qs = vec![0u8; rows * cols / 2];
-                let mut scales = vec![0.0; rows * cols / BLOCK];
+                let mut scales = vec![0u16; rows * cols / BLOCK];
                 qs.par_chunks_mut(cols / 2)
                     .zip(scales.par_chunks_mut(cols / BLOCK))
                     .zip(w.par_chunks(cols))
@@ -224,14 +224,14 @@ impl Linear {
         out: &mut [f32],
         n: usize,
         tile: QuantTile<W>,
-        row: impl Fn(usize) -> (&'a [W], &'a [f32]) + Sync,
+        row: impl Fn(usize) -> (&'a [W], &'a [u16]) + Sync,
         token: impl Fn(usize) -> Q8Slice<'a> + Sync,
         dot: impl Fn(usize, usize) -> f32 + Sync,
     ) {
         pool().par_matrix_blocks(out, self.rows, ROWS_PER_TASK, |rows, set| {
             let full_rows = rows.start + (rows.len() / TILE) * TILE;
             for r0 in (rows.start..full_rows).step_by(TILE) {
-                let (w, ws): ([&[W]; TILE], [&[f32]; TILE]) = (
+                let (w, ws): ([&[W]; TILE], [&[u16]; TILE]) = (
                     std::array::from_fn(|i| row(r0 + i).0),
                     std::array::from_fn(|i| row(r0 + i).1),
                 );
@@ -283,8 +283,8 @@ impl Linear {
         match &self.storage {
             Storage::F32(w) => w.len() * 4,
             Storage::Bf16(w) => w.len() * 2,
-            Storage::Q8 { qs, scales } => qs.len() + scales.len() * 4,
-            Storage::Q4 { qs, scales } => qs.len() + scales.len() * 4,
+            Storage::Q8 { qs, scales } => qs.len() + scales.len() * 2,
+            Storage::Q4 { qs, scales } => qs.len() + scales.len() * 2,
         }
     }
 }

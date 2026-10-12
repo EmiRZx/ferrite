@@ -1,4 +1,4 @@
-//! AVX2 + FMA kernels (8 x f32 per register).
+//! AVX2 + FMA kernels (8 x f32 per register); F16C converts the f16 weight scales.
 //!
 //! These are `#[target_feature]` functions: calling them is only sound on a CPU with
 //! AVX2 and FMA, which `Kernels::for_isa` checks before handing them out. Lengths are
@@ -9,7 +9,7 @@ use std::arch::x86_64::*;
 use crate::quant::BLOCK;
 
 #[inline]
-#[target_feature(enable = "avx2,fma")]
+#[target_feature(enable = "avx2,fma,f16c")]
 pub fn hsum(v: __m256) -> f32 {
     let s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps::<1>(v));
     let s = _mm_add_ps(s, _mm_movehl_ps(s, s));
@@ -17,7 +17,7 @@ pub fn hsum(v: __m256) -> f32 {
     _mm_cvtss_f32(s)
 }
 
-#[target_feature(enable = "avx2,fma")]
+#[target_feature(enable = "avx2,fma,f16c")]
 pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
     let n = a.len();
@@ -46,7 +46,7 @@ pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     hsum(sum) + super::scalar::dot_f32(&a[i..], &b[i..])
 }
 
-#[target_feature(enable = "avx2,fma")]
+#[target_feature(enable = "avx2,fma,f16c")]
 pub fn axpy_f32(y: &mut [f32], a: f32, x: &[f32]) {
     assert_eq!(y.len(), x.len());
     let n = y.len();
@@ -65,12 +65,12 @@ pub fn axpy_f32(y: &mut [f32], a: f32, x: &[f32]) {
 
 /// Widens 8 bf16 values to f32: zero-extend to 32 bits, then shift into the high half.
 #[inline]
-#[target_feature(enable = "avx2,fma")]
+#[target_feature(enable = "avx2,fma,f16c")]
 fn widen_bf16(v: __m128i) -> __m256 {
     _mm256_castsi256_ps(_mm256_slli_epi32::<16>(_mm256_cvtepu16_epi32(v)))
 }
 
-#[target_feature(enable = "avx2,fma")]
+#[target_feature(enable = "avx2,fma,f16c")]
 pub fn dot_bf16(w: &[u16], x: &[f32]) -> f32 {
     assert_eq!(w.len(), x.len());
     let n = w.len();
@@ -108,7 +108,7 @@ pub fn dot_bf16(w: &[u16], x: &[f32]) -> f32 {
 /// `maddubs` needs one unsigned operand, so we move x's sign onto w:
 /// `w * x == (w * sign(x)) * |x|`. Neither side is ever -128, so nothing saturates.
 #[inline]
-#[target_feature(enable = "avx2,fma")]
+#[target_feature(enable = "avx2,fma,f16c")]
 pub fn mul_sum_i8(w: __m256i, x: __m256i) -> __m256 {
     let ax = _mm256_sign_epi8(x, x);
     let sw = _mm256_sign_epi8(w, x);
@@ -118,7 +118,7 @@ pub fn mul_sum_i8(w: __m256i, x: __m256i) -> __m256 {
 
 /// Unpacks one Q4 block (16 bytes) into 32 signed bytes in `[-8, 7]`.
 #[inline]
-#[target_feature(enable = "avx2,fma")]
+#[target_feature(enable = "avx2,fma,f16c")]
 pub fn unpack_q4(raw: __m128i) -> __m256i {
     let m4 = _mm_set1_epi8(0x0F);
     let lo = _mm_and_si128(raw, m4);
@@ -126,8 +126,8 @@ pub fn unpack_q4(raw: __m128i) -> __m256i {
     _mm256_sub_epi8(_mm256_set_m128i(hi, lo), _mm256_set1_epi8(8))
 }
 
-#[target_feature(enable = "avx2,fma")]
-pub fn dot_q8(wq: &[i8], ws: &[f32], xq: &[i8], xs: &[f32]) -> f32 {
+#[target_feature(enable = "avx2,fma,f16c")]
+pub fn dot_q8(wq: &[i8], ws: &[u16], xq: &[i8], xs: &[f32]) -> f32 {
     super::check_q8(wq.len(), ws, xq, xs);
     let mut acc = _mm256_setzero_ps();
     for b in 0..ws.len() {
@@ -137,13 +137,13 @@ pub fn dot_q8(wq: &[i8], ws: &[f32], xq: &[i8], xs: &[f32]) -> f32 {
                 _mm256_loadu_si256(xq.as_ptr().add(b * BLOCK).cast()),
             )
         };
-        acc = _mm256_fmadd_ps(_mm256_set1_ps(ws[b] * xs[b]), mul_sum_i8(w, x), acc);
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(f16(ws[b]) * xs[b]), mul_sum_i8(w, x), acc);
     }
     hsum(acc)
 }
 
-#[target_feature(enable = "avx2,fma")]
-pub fn dot_q4(wq: &[u8], ws: &[f32], xq: &[i8], xs: &[f32]) -> f32 {
+#[target_feature(enable = "avx2,fma,f16c")]
+pub fn dot_q4(wq: &[u8], ws: &[u16], xq: &[i8], xs: &[f32]) -> f32 {
     super::check_q8(wq.len() * 2, ws, xq, xs);
     let mut acc = _mm256_setzero_ps();
     for b in 0..ws.len() {
@@ -154,7 +154,7 @@ pub fn dot_q4(wq: &[u8], ws: &[f32], xq: &[i8], xs: &[f32]) -> f32 {
             )
         };
         acc = _mm256_fmadd_ps(
-            _mm256_set1_ps(ws[b] * xs[b]),
+            _mm256_set1_ps(f16(ws[b]) * xs[b]),
             mul_sum_i8(unpack_q4(raw), x),
             acc,
         );
@@ -162,7 +162,7 @@ pub fn dot_q4(wq: &[u8], ws: &[f32], xq: &[i8], xs: &[f32]) -> f32 {
     hsum(acc)
 }
 
-#[target_feature(enable = "avx2,fma")]
+#[target_feature(enable = "avx2,fma,f16c")]
 pub fn quantize_q8(x: &[f32], qs: &mut [i8], scales: &mut [f32]) {
     assert!(x.len() == scales.len() * BLOCK && qs.len() == x.len());
     let abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFF_FFFF));
@@ -191,7 +191,7 @@ pub fn quantize_q8(x: &[f32], qs: &mut [i8], scales: &mut [f32]) {
 }
 
 /// The generic attention kernel, compiled (and auto-vectorized) for this ISA.
-#[target_feature(enable = "avx2,fma")]
+#[target_feature(enable = "avx2,fma,f16c")]
 pub fn attention(
     q: &[f32],
     kv: &dyn super::attention::KvTiles,
@@ -200,4 +200,11 @@ pub fn attention(
     out: &mut [f32],
 ) {
     super::attention::attention_impl::<true>(q, kv, limits, scale, out)
+}
+
+/// One f16 value to f32 with the F16C instruction.
+#[inline]
+#[target_feature(enable = "avx2,fma,f16c")]
+pub fn f16(h: u16) -> f32 {
+    _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(h as i32)))
 }

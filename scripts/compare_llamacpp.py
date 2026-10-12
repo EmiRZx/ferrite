@@ -26,7 +26,6 @@ FERRITE = os.path.abspath("target/release/ferrite" + EXE)
 LLAMA_BENCH = os.path.abspath("third_party/llama.cpp/bin/llama-bench" + EXE)
 GGUF = "third_party/llama.cpp/models/qwen3-0.6b-{}.gguf"
 FORMATS = [("bf16", "bf16"), ("q8", "q8_0"), ("q4", "q4_0")]  # ferrite dtype, GGUF type
-TESTS = [("pp512", 8), ("pp512", 16), ("tg128", 8)]
 
 
 def run(cmd):
@@ -52,12 +51,16 @@ def llama(gguf_type, test, threads):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--rounds", type=int, default=3)
+    parser.add_argument("--formats", default="bf16,q8,q4", help="ferrite dtypes to compare")
+    parser.add_argument("--tests", default="pp512@8,pp512@16,tg128@8")
     args = parser.parse_args()
+    formats = [f for f in FORMATS if f[0] in args.formats.split(",")]
+    tests = [(t.split("@")[0], int(t.split("@")[1])) for t in args.tests.split(",")]
 
     results = {}
     for r in range(args.rounds):
-        for dtype, gguf_type in FORMATS:
-            for test, threads in TESTS:
+        for dtype, gguf_type in formats:
+            for test, threads in tests:
                 engines = [("ferrite", lambda: ferrite(dtype, test, threads)),
                            ("llama.cpp", lambda: llama(gguf_type, test, threads))]
                 for name, fn in engines if r % 2 == 0 else reversed(engines):
@@ -67,8 +70,8 @@ def main():
 
     print("\n| weights | test | threads | ferrite tok/s | llama.cpp tok/s | ferrite / llama.cpp |")
     print("|---|---|---:|---:|---:|---:|")
-    for dtype, _ in FORMATS:
-        for test, threads in TESTS:
+    for dtype, _ in formats:
+        for test, threads in tests:
             f = statistics.median(results[(dtype, test, threads, "ferrite")])
             l = statistics.median(results[(dtype, test, threads, "llama.cpp")])
             print(f"| {dtype} | {test} | {threads} | {f:.1f} | {l:.1f} | {f / l:.2f}x |")

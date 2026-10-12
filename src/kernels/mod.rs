@@ -31,7 +31,11 @@ impl Isa {
         match self {
             Isa::Scalar => true,
             #[cfg(target_arch = "x86_64")]
-            Isa::Avx2 => is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma"),
+            Isa::Avx2 => {
+                is_x86_feature_detected!("avx2")
+                    && is_x86_feature_detected!("fma")
+                    && is_x86_feature_detected!("f16c")
+            }
             #[cfg(target_arch = "x86_64")]
             Isa::Avx512 => {
                 Isa::Avx2.is_supported()
@@ -77,9 +81,9 @@ impl FromStr for Isa {
     }
 }
 
-/// Dot product of block-quantized weights `(quants, scales)` with Q8 activations.
+/// Dot product of block-quantized weights `(quants, f16 scales)` with Q8 activations.
 /// `W` is `i8` for Q8 and packed nibbles (`u8`) for Q4.
-pub type QuantDot<W> = fn(&[W], &[f32], Q8Slice) -> f32;
+pub type QuantDot<W> = fn(&[W], &[u16], Q8Slice) -> f32;
 
 /// Multi-query attention over one KV head, see [`attention::attention_impl`]:
 /// `(queries, KV tiles, per-query visible lengths, scale, out)`.
@@ -89,7 +93,7 @@ pub type AttentionFn = fn(&[f32], &dyn attention::KvTiles, &[usize], f32, &mut [
 pub const TILE: usize = 4;
 
 /// `TILE` weight rows `(quants, scales)` × `TILE` tokens in one call; result `[row][token]`.
-pub type QuantTile<W> = fn([&[W]; TILE], [&[f32]; TILE], [Q8Slice; TILE]) -> [[f32; TILE]; TILE];
+pub type QuantTile<W> = fn([&[W]; TILE], [&[u16]; TILE], [Q8Slice; TILE]) -> [[f32; TILE]; TILE];
 
 pub struct Kernels {
     pub isa: Isa,
@@ -185,7 +189,7 @@ pub fn kernels() -> &'static Kernels {
 
 /// Shape check shared by the quantized dot products; `n` is the number of weights.
 #[inline]
-fn check_q8(n: usize, ws: &[f32], xq: &[i8], xs: &[f32]) {
+fn check_q8(n: usize, ws: &[u16], xq: &[i8], xs: &[f32]) {
     assert!(
         n == ws.len() * BLOCK && xq.len() == n && xs.len() == ws.len(),
         "quantized dot product shape mismatch"
@@ -196,7 +200,7 @@ fn check_q8(n: usize, ws: &[f32], xq: &[i8], xs: &[f32]) {
 mod tests {
     use super::*;
     use crate::{
-        quant::{Q8Vec, quantize_q4, quantize_q8},
+        quant::{Q8Vec, quantize_q4, quantize_q8_weights},
         sampler::Rng,
     };
 
@@ -252,9 +256,9 @@ mod tests {
         for blocks in [1, 2, 3, 8, 15, 16, 17, 31, 32, 96] {
             let n = blocks * BLOCK;
             let (w, x) = (random(&mut rng, n), random(&mut rng, n));
-            let (mut w8, mut w8s) = (vec![0i8; n], vec![0.0; blocks]);
-            let (mut w4, mut w4s) = (vec![0u8; n / 2], vec![0.0; blocks]);
-            quantize_q8(&w, &mut w8, &mut w8s);
+            let (mut w8, mut w8s) = (vec![0i8; n], vec![0u16; blocks]);
+            let (mut w4, mut w4s) = (vec![0u8; n / 2], vec![0u16; blocks]);
+            quantize_q8_weights(&w, &mut w8, &mut w8s);
             quantize_q4(&w, &mut w4, &mut w4s);
             let mut xv = Q8Vec::default();
             xv.quantize(&x);
@@ -299,10 +303,13 @@ mod tests {
             let n = blocks * BLOCK;
             let mut w8 = vec![vec![0i8; n]; TILE];
             let mut w4 = vec![vec![0u8; n / 2]; TILE];
-            let (mut s8, mut s4) = (vec![vec![0.0; blocks]; TILE], vec![vec![0.0; blocks]; TILE]);
+            let (mut s8, mut s4) = (
+                vec![vec![0u16; blocks]; TILE],
+                vec![vec![0u16; blocks]; TILE],
+            );
             for r in 0..TILE {
                 let w = random(&mut rng, n);
-                quantize_q8(&w, &mut w8[r], &mut s8[r]);
+                quantize_q8_weights(&w, &mut w8[r], &mut s8[r]);
                 quantize_q4(&w, &mut w4[r], &mut s4[r]);
             }
             let mut xv = Q8Vec::default();

@@ -14,7 +14,7 @@ fn tail_mask(n: usize) -> __mmask16 {
     ((1u32 << n) - 1) as __mmask16
 }
 
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx2,fma")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx2,fma,f16c")]
 pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
     let n = a.len();
@@ -55,7 +55,7 @@ pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     ))
 }
 
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx2,fma")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx2,fma,f16c")]
 pub fn axpy_f32(y: &mut [f32], a: f32, x: &[f32]) {
     assert_eq!(y.len(), x.len());
     let n = y.len();
@@ -77,12 +77,12 @@ pub fn axpy_f32(y: &mut [f32], a: f32, x: &[f32]) {
 }
 
 #[inline]
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx2,fma")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx2,fma,f16c")]
 fn widen_bf16(v: __m256i) -> __m512 {
     _mm512_castsi512_ps(_mm512_slli_epi32::<16>(_mm512_cvtepu16_epi32(v)))
 }
 
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx2,fma")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx2,fma,f16c")]
 pub fn dot_bf16(w: &[u16], x: &[f32]) -> f32 {
     assert_eq!(w.len(), x.len());
     let n = w.len();
@@ -118,7 +118,7 @@ pub fn dot_bf16(w: &[u16], x: &[f32]) -> f32 {
 /// Index vectors for `vpermd`/`vpermps`: entry `i` sends element `2i` to lanes 0..8
 /// and element `2i + 1` to lanes 8..16, i.e. block pair `i` of a 16-block group.
 #[inline]
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx2,fma")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx2,fma,f16c")]
 fn pair_indices() -> [__m512i; 8] {
     let base = _mm512_set_epi32(1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0);
     std::array::from_fn(|i| _mm512_add_epi32(base, _mm512_set1_epi32(2 * i as i32)))
@@ -136,9 +136,9 @@ fn pair_indices() -> [__m512i; 8] {
 /// Work proceeds in groups of 16 blocks so the 16 scale products are one vector
 /// multiply; `load_pair(b)` returns the 64 unsigned weight bytes of blocks `b, b + 1`.
 #[inline]
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx2,fma")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx2,fma,f16c")]
 fn dot_quant_groups(
-    ws: &[f32],
+    ws: &[u16],
     x: Q8Slice,
     offset_shift: u32,
     load_pair: impl Fn(usize) -> __m512i,
@@ -150,7 +150,7 @@ fn dot_quant_groups(
     while b + 16 <= nb {
         let (wsv, xsv, sums) = unsafe {
             (
-                _mm512_loadu_ps(ws.as_ptr().add(b)),
+                _mm512_cvtph_ps(_mm256_loadu_si256(ws.as_ptr().add(b).cast())),
                 _mm512_loadu_ps(x.scales.as_ptr().add(b)),
                 _mm512_loadu_si512(x.sums.as_ptr().add(b).cast()),
             )
@@ -176,8 +176,8 @@ fn dot_quant_groups(
     (_mm512_reduce_add_ps(acc), b)
 }
 
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx2,fma")]
-pub fn dot_q8(wq: &[i8], ws: &[f32], x: Q8Slice) -> f32 {
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx2,fma,f16c")]
+pub fn dot_q8(wq: &[i8], ws: &[u16], x: Q8Slice) -> f32 {
     super::check_q8(wq.len(), ws, x.qs, x.scales);
     let flip = _mm512_set1_epi8(i8::MIN);
     let (sum, b) = dot_quant_groups(ws, x, 7, |pair| {
@@ -189,8 +189,8 @@ pub fn dot_q8(wq: &[i8], ws: &[f32], x: Q8Slice) -> f32 {
     sum + super::scalar::dot_q8(&wq[tail..], &ws[b..], &x.qs[tail..], &x.scales[b..])
 }
 
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx2,fma")]
-pub fn dot_q4(wq: &[u8], ws: &[f32], x: Q8Slice) -> f32 {
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx2,fma,f16c")]
+pub fn dot_q4(wq: &[u8], ws: &[u16], x: Q8Slice) -> f32 {
     super::check_q8(wq.len() * 2, ws, x.qs, x.scales);
     let m4 = _mm512_set1_epi8(0x0F);
     let (sum, b) = dot_quant_groups(ws, x, 3, |pair| {
@@ -212,9 +212,9 @@ pub fn dot_q4(wq: &[u8], ws: &[f32], x: Q8Slice) -> f32 {
 /// activation register `TILE` rows, and the per-call overhead (setup, horizontal
 /// sums, tails) is shared by `TILE²` dot products.
 #[inline]
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx2,fma")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx2,fma,f16c")]
 fn tile_groups(
-    ws: [&[f32]; TILE],
+    ws: [&[u16]; TILE],
     x: [Q8Slice; TILE],
     offset_shift: u32,
     load_pair: impl Fn(usize, usize) -> __m512i,
@@ -225,8 +225,9 @@ fn tile_groups(
     let mut b = 0;
     while b + 16 <= nb {
         // SAFETY (all loads): `b + 16 <= nb` and every slice was checked to hold `nb` blocks.
-        let wsv: [__m512; TILE] =
-            std::array::from_fn(|r| unsafe { _mm512_loadu_ps(ws[r].as_ptr().add(b)) });
+        let wsv: [__m512; TILE] = std::array::from_fn(|r| unsafe {
+            _mm512_cvtph_ps(_mm256_loadu_si256(ws[r].as_ptr().add(b).cast()))
+        });
         let xsv: [__m512; TILE] =
             std::array::from_fn(|t| unsafe { _mm512_loadu_ps(x[t].scales.as_ptr().add(b)) });
         let corrections: [__m512i; TILE] = std::array::from_fn(|t| {
@@ -258,8 +259,8 @@ fn tile_groups(
     (out, b)
 }
 
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx2,fma")]
-pub fn tile_q8(w: [&[i8]; TILE], ws: [&[f32]; TILE], x: [Q8Slice; TILE]) -> [[f32; TILE]; TILE] {
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx2,fma,f16c")]
+pub fn tile_q8(w: [&[i8]; TILE], ws: [&[u16]; TILE], x: [Q8Slice; TILE]) -> [[f32; TILE]; TILE] {
     for r in 0..TILE {
         for xt in x {
             super::check_q8(w[r].len(), ws[r], xt.qs, xt.scales);
@@ -285,8 +286,8 @@ pub fn tile_q8(w: [&[i8]; TILE], ws: [&[f32]; TILE], x: [Q8Slice; TILE]) -> [[f3
     out
 }
 
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx2,fma")]
-pub fn tile_q4(w: [&[u8]; TILE], ws: [&[f32]; TILE], x: [Q8Slice; TILE]) -> [[f32; TILE]; TILE] {
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx2,fma,f16c")]
+pub fn tile_q4(w: [&[u8]; TILE], ws: [&[u16]; TILE], x: [Q8Slice; TILE]) -> [[f32; TILE]; TILE] {
     for r in 0..TILE {
         for xt in x {
             super::check_q8(w[r].len() * 2, ws[r], xt.qs, xt.scales);
@@ -314,7 +315,7 @@ pub fn tile_q4(w: [&[u8]; TILE], ws: [&[f32]; TILE], x: [Q8Slice; TILE]) -> [[f3
     out
 }
 
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx2,fma")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx2,fma,f16c")]
 pub fn quantize_q8(x: &[f32], qs: &mut [i8], scales: &mut [f32]) {
     assert!(x.len() == scales.len() * BLOCK && qs.len() == x.len());
     for (b, scale) in scales.iter_mut().enumerate() {
@@ -336,7 +337,7 @@ pub fn quantize_q8(x: &[f32], qs: &mut [i8], scales: &mut [f32]) {
 
 /// `e^x` on 16 lanes; the vector form of [`super::attention::exp_approx`].
 #[inline]
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx2,fma")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx2,fma,f16c")]
 fn exp_ps(x: __m512) -> __m512 {
     let xc = _mm512_min_ps(
         _mm512_max_ps(x, _mm512_set1_ps(-87.0)),
@@ -381,7 +382,7 @@ const QUERY_GROUP: usize = 4;
 /// # Safety
 /// `q` must point to `G * hd` floats and `kt` to `hd * 32`.
 #[inline]
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx2,fma")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx2,fma,f16c")]
 unsafe fn score_queries<const G: usize>(
     q: *const f32,
     kt: *const f32,
@@ -408,7 +409,7 @@ unsafe fn score_queries<const G: usize>(
 
 /// Hand-vectorized [`super::attention::attention_impl`] for head dims that are a
 /// multiple of 16 (LLVM keeps the generic loops scalar). Same contract.
-#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx2,fma")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx2,fma,f16c")]
 pub fn attention(
     q: &[f32],
     kv: &dyn super::attention::KvTiles,
