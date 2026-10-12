@@ -1,21 +1,65 @@
 # ferrite
 
-A from-scratch CPU inference engine for large language models, written in Rust.
+[![CI](https://github.com/EmiRZx/ferrite/actions/workflows/ci.yml/badge.svg)](https://github.com/EmiRZx/ferrite/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-No ML frameworks. The safetensors loader, byte-level BPE tokenizer, transformer
-forward pass, quantization formats, SIMD kernels, thread pool and sampler are all
-implemented in this repository, and every step is verified numerically against
-Hugging Face `transformers`.
+**A CPU inference engine for LLMs, written from scratch in Rust.** There is no ML
+framework underneath. The tokenizer, transformer, quantization formats, SIMD kernels,
+thread pool, paged KV cache and an OpenAI-compatible server are all in this repository,
+and every layer is checked against Hugging Face `transformers`.
 
-The target model is [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B). The goal is to
-take it from a naive scalar implementation to a fast, quantized, SIMD-optimized engine
-and document *why* each optimization works along the way.
+<p align="center">
+  <img src="docs/assets/demo.gif" width="760" alt="ferrite streaming an answer from Qwen3-0.6B at ~85 tokens per second on a laptop CPU">
+</p>
 
-```text
-$ ferrite -d q4 run "What is the capital of France? Answer in one sentence." -t 0
-loaded models/qwen3-0.6b as q4 in 3.69s (394 MiB of weights, avx512 kernels, 8 threads)
-The capital of France is Paris.
+## Highlights
+
+- **On par with llama.cpp** on the same laptop CPU (Ryzen 9 7940HS), same checkpoint
+  and same quantization. Decode 1.03× (Q8), Q8 prefill 1.10×, serving throughput equal
+  at 16 concurrent requests and 23% higher at 4. Its Q4 is more accurate (12% lower KL
+  divergence). It still trails on bf16 and Q4 prefill, and the reasons are documented.
+  [Full comparison](docs/llama-cpp-comparison.md).
+- **Hand-written AVX-512 VNNI kernels** with runtime CPU dispatch (AVX2 and scalar
+  fallbacks): a register-tiled int8 GEMM microkernel, FlashAttention-style tiled
+  attention, and Q8/Q4 weights with f16 block scales.
+- **The serving features of a real inference server**: OpenAI-compatible API with SSE
+  streaming, continuous batching with chunked prefill, and a paged KV cache
+  (PagedAttention-style) with recompute preemption.
+- **Correctness first**: logits match `transformers` to 5e-5, including over long
+  contexts. WikiText-2 perplexity is identical to four digits. 36 tests run in CI.
+- **Every optimization is measured**: decode went from 13 to 102 tok/s and prefill from
+  60 to 471 tok/s. The dead ends are written up too.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/vs-llamacpp-dark.svg">
+  <img src="docs/assets/vs-llamacpp-light.svg" alt="Bar chart of ferrite throughput relative to llama.cpp at 8 threads. Decode: bf16 1.05x, Q8 1.03x, Q4 0.94x. Prefill: bf16 0.25x, Q8 1.10x, Q4 0.64x.">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/serving-dark.svg">
+  <img src="docs/assets/serving-light.svg" alt="Line chart of total serving throughput versus concurrent requests. ferrite: 64, 169, 222, 251 tok/s at 1, 4, 8, 16 requests; llama-server: about 61, 137, 193, 248 tok/s.">
+</picture>
+
+## Architecture
+
+```mermaid
+flowchart LR
+  client["OpenAI client"] -->|"HTTP + SSE"| server["server.rs<br/>axum"]
+  server -->|"request queue"| engine["engine.rs<br/>continuous batching"]
+  engine -->|"ragged batch"| model["model.rs<br/>Qwen3 forward pass"]
+  engine --- kv[("kv.rs<br/>paged KV cache")]
+  model --> linear["linear.rs<br/>GEMM / matvec"]
+  model --> attn["kernels/attention<br/>tiled attention"]
+  attn --- kv
+  linear --> kernels["kernels/<br/>AVX-512 VNNI · AVX2 · scalar"]
+  model --> pool["pool.rs<br/>spin-waiting thread pool"]
 ```
+
+A request is tokenized and queued. Every engine step runs **one** forward pass over a
+ragged batch: the next token of every running request plus prompt chunks of new ones.
+The matmuls read each weight once for the whole batch, and attention reads each
+request's own KV pages. Everything below the server is synchronous Rust on a custom
+thread pool. The async runtime only moves bytes.
 
 ## Quick start
 
@@ -146,22 +190,22 @@ sensitive layers is on the roadmap.
 ## Comparison with llama.cpp
 
 Same machine, same checkpoint (converted to GGUF with llama.cpp's own script), matching
-quantization formats, each engine at its best thread count and settings. Full method,
-serving results and analysis: [docs/llama-cpp-comparison.md](docs/llama-cpp-comparison.md).
+quantization formats, llama.cpp b11393 with its Zen 4 backend and flash attention.
+Full method, serving results and analysis: [docs/llama-cpp-comparison.md](docs/llama-cpp-comparison.md).
 
-| weights | prefill (pp512) | decode (tg128) | KL to unquantized |
+| weights | prefill (pp512, 8 threads) | decode (tg128) | KL to unquantized (ferrite vs llama.cpp) |
 |---|---:|---:|---:|
-| bf16 | 0.19-0.25× | 1.05× | – |
-| Q8 | 0.96-1.06× | 1.03× | 0.0025 vs 0.0026 |
-| Q4 | 0.36-0.56× | 0.94× | **0.181 vs 0.206** |
+| bf16 | 0.25× | 1.05× | – |
+| Q8 | 1.10× | 1.03× | 0.0025 vs 0.0026 |
+| Q4 | 0.64× | 0.94× | **0.181 vs 0.206** |
 
-(ferrite relative to llama.cpp b11393 with its Zen 4 backend.) Decode, Q8 prefill and
-serving throughput are on par: both engines run into the same memory wall and use the
-same VNNI instructions. llama.cpp is well ahead on bf16 prefill (it uses AVX512-BF16
-`vdpbf16ps`, ferrite has no bf16 GEMM kernel) and on Q4 prefill (it repacks Q4_0 into a
-GEMM-friendly layout at load time). ferrite's Q4 quantizes more accurately. The
-comparison also caught a bug in this repo's data pipeline (CRLF line endings, see the
-write-up), which led to a long-context reference test.
+Decode, Q8 prefill and serving throughput are on par: both engines hit the same
+memory wall and use the same VNNI instructions. llama.cpp is well ahead on bf16
+prefill, because it uses AVX512-BF16 `vdpbf16ps` and ferrite has no bf16 GEMM kernel.
+It is also ahead on Q4 prefill, because it repacks Q4_0 into a GEMM-friendly layout at
+load time. ferrite's Q4 quantizes more accurately. The comparison also caught a bug in
+this repo's data pipeline (CRLF line endings, see the write-up), which led to a
+long-context reference test, and it led to the switch to f16 block scales.
 
 ## How it got fast
 

@@ -5,6 +5,9 @@ edition = "2024"
 description = "A from-scratch CPU inference engine for LLMs, written in Rust"
 license = "MIT"
 readme = "README.md"
+repository = "https://github.com/EmiRZx/ferrite"
+keywords = ["llm", "inference", "simd", "quantization", "avx512"]
+categories = ["science", "command-line-utilities"]
 
 [dependencies]
 anyhow = "1"
